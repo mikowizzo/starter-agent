@@ -1,0 +1,73 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --color-bg: #181818;
+  --color-panel: #242424;
+  --color-border: #383838;
+  --color-text: #ececec;
+  --color-dim: #909090;
+  --color-user: #3a3a3a;
+  --color-accent: #ff6b9d;
+  --color-pink: #ff4d88;
+}
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
+}
+
+/* Inline links — Tailwind prelight resets <a> to inherit colour, making them
+   invisible against body text. Restore a distinct, readable style. */
+.prose a {
+  color: #ff8fb1;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: rgba(255, 143, 177, 0.4);
+  transition: color 0.15s, text-decoration-color 0.15s;
+}
+.prose a:hover {
+  color: #ffb3cc;
+  text-decoration-color: rgba(255, 179, 204, 0.7);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background: var(--color-bg);
+}
+
+html,
+body {
+  overscroll-behavior: none;
+}
+
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.15s ease-out;
+}
+
+@keyframes slide-up {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.2s ease-out;
+}

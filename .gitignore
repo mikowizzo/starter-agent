@@ -1,0 +1,21 @@
+# Environment
+.env
+
+# Databases
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Backups
+*.bak
+*.bak.*

@@ -1,0 +1,5 @@
+uvicorn[standard]>=0.40.0,<0.41.0
+agno[os]>=2.6.0,<2.7.0
+agno[openai]>=2.6.0,<2.7.0
+ag-ui-protocol
+requests>=2.31.0
