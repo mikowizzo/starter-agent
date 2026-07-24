@@ -6,6 +6,7 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - .:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
     env_file:
       - .env
     environment:

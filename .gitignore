@@ -19,3 +19,6 @@ frontend/dist/
 # Backups
 *.bak
 *.bak.*
+-e 
+# Clones
+.clones/

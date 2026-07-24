@@ -3,7 +3,7 @@ FROM python:3.12-slim
 COPY --from=ghcr.io/astral-sh/uv:0.6.14 /uv /bin/uv
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git ca-certificates ripgrep \
+      git ca-certificates ripgrep docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace/backend
