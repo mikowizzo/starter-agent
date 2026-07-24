@@ -68,6 +68,17 @@ class CloneTools(Toolkit):
         )
 
     @staticmethod
+    def _docker_available() -> bool:
+        """Check if docker CLI exists and can reach the daemon."""
+        try:
+            r = subprocess.run(
+                ["docker", "info"], capture_output=True, text=True, timeout=10,
+            )
+            return r.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    @staticmethod
     def _compose_cmd(name: str, *args: str) -> subprocess.CompletedProcess:
         clone_dir = _CLONES_DIR / name
         return subprocess.run(
@@ -89,6 +100,14 @@ class CloneTools(Toolkit):
         name = name.strip().lower().replace(" ", "-")
         if not name:
             return "Error: Clone name cannot be empty."
+
+        if not self._docker_available():
+            return (
+                "Error: Docker is not available inside this container.\n"
+                "This means the Docker socket isn't mounted or the docker CLI\n"
+                "isn't installed. Check docker-compose.yml for the socket mount\n"
+                "and the Dockerfile for the docker CLI installation."
+            )
 
         registry = self._load_registry()
         if any(c["name"] == name for c in registry):
