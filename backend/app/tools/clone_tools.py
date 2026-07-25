@@ -55,7 +55,11 @@ class CloneTools(Toolkit):
     @staticmethod
     def _load_registry() -> list[dict]:
         if _REGISTRY.exists():
-            return json.loads(_REGISTRY.read_text())
+            data = json.loads(_REGISTRY.read_text())
+            # Guard against corrupted registry (dict instead of list).
+            if isinstance(data, list):
+                return data
+            return []
         return []
 
     @staticmethod
