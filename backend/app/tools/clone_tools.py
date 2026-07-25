@@ -438,12 +438,13 @@ class CloneTools(Toolkit):
         # point to wrong/empty directories. Instead of stripping them (which
         # kills HMR), detect our own host workspace path and rewrite relative
         # mounts to absolute host paths. This preserves live file watching.
-        host_ws = self._host_workspace_dir()
-        if host_ws:
+        parent_host_ws = self._host_workspace_dir()
+        clone_host_ws = str(Path(parent_host_ws) / ".clones" / name) if parent_host_ws else None
+        if clone_host_ws:
             def _rewrite_mount(m):
-                # m.group(3) is the relative path like ./frontend or ./.env
+                # m.group(3) is the relative path like ./frontend, ./.env, or .
                 clean = m.group(3).strip("'").strip('"')
-                host_path = str(Path(host_ws) / clean)
+                host_path = str(Path(clone_host_ws) / clean)
                 return f"{m.group(1)}{host_path}{m.group(4)}"
 
             compose = re.sub(
