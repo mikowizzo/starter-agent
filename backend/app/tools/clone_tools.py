@@ -30,6 +30,11 @@ _EXCLUDE = {
 # this agent's live working directory. Clones are experiments; they start fresh.
 _CLONE_REPO = "https://github.com/mikowizzo/starter-agent.git"
 
+# Strict name pattern — prevents path traversal (../) and invalid Docker
+# project names. Lowercase alphanumeric + hyphens, must start/end with
+# alphanumeric.
+_NAME_RE = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
+
 
 class CloneTools(Toolkit):
     """Create, list, stop, start, and destroy clones of this agent."""
@@ -45,6 +50,7 @@ class CloneTools(Toolkit):
                 self.destroy_clone,
             ],
         )
+        self._lock = asyncio.Lock()
 
     @staticmethod
     def _load_registry() -> list[dict]:
@@ -58,12 +64,29 @@ class CloneTools(Toolkit):
         _REGISTRY.write_text(json.dumps(clones, indent=2))
 
     @staticmethod
+    def _port_in_use(port: int) -> bool:
+        """Check if a port is already bound by a running container."""
+        try:
+            r = subprocess.run(
+                ["docker", "ps", "--format", "{{.Ports}}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return f":{port}->" in r.stdout
+        except Exception:
+            return False
+
+    @staticmethod
     def _next_ports(registry: list[dict]) -> tuple[int, int]:
-        if not registry:
-            return _BASE_PORT_BACKEND, _BASE_PORT_FRONTEND
-        max_b = max(c["ports"]["backend"] for c in registry)
-        max_f = max(c["ports"]["frontend"] for c in registry)
-        return max_b + 1, max_f + 1
+        b, f = _BASE_PORT_BACKEND, _BASE_PORT_FRONTEND
+        if registry:
+            b = max(c["ports"]["backend"] for c in registry) + 1
+            f = max(c["ports"]["frontend"] for c in registry) + 1
+        # Advance past any ports already bound by running containers
+        # (orphaned containers from a failed destroy, manual docker run, etc.)
+        while CloneTools._port_in_use(b) or CloneTools._port_in_use(f):
+            b += 1
+            f += 1
+        return b, f
 
     @staticmethod
     async def _compose_up(clone_dir: Path, name: str) -> subprocess.CompletedProcess:
@@ -144,21 +167,36 @@ class CloneTools(Toolkit):
         name = name.strip().lower().replace(" ", "-")
         if not name:
             return "Error: Clone name cannot be empty."
+        if not _NAME_RE.match(name):
+            return (
+                "Error: Invalid name. Use lowercase letters, numbers, and "
+                "hyphens only (e.g. 'my-clone')."
+            )
 
         ok, msg = await self._docker_check()
         if not ok:
             return f"Error: {msg}"
 
-        registry = self._load_registry()
-        if any(c["name"] == name for c in registry):
-            return f"Error: Clone '{name}' already exists."
+        # Atomically reserve the name and ports so concurrent create_clone
+        # calls don't collide. Heavy work (git clone, docker build) happens
+        # outside the lock.
+        async with self._lock:
+            registry = self._load_registry()
+            if any(c["name"] == name for c in registry):
+                return f"Error: Clone '{name}' already exists."
+            clone_dir = _CLONES_DIR / name
+            if clone_dir.exists():
+                return f"Error: Directory {clone_dir} already exists."
+            port_b, port_f = self._next_ports(registry)
+            # Pre-register as pending so concurrent calls get different ports
+            registry.append({
+                "name": name,
+                "ports": {"backend": port_b, "frontend": port_f},
+                "status": "pending",
+            })
+            self._save_registry(registry)
 
         clone_dir = _CLONES_DIR / name
-        if clone_dir.exists():
-            return f"Error: Directory {clone_dir} already exists."
-
-        port_b, port_f = self._next_ports(registry)
-        _CLONES_DIR.mkdir(parents=True, exist_ok=True)
 
         # Clone from the canonical starter-agent repo so every clone starts
         # from a clean, unmodified template — not this agent's live working
@@ -171,6 +209,7 @@ class CloneTools(Toolkit):
 
         git_result = await asyncio.to_thread(_git_clone)
         if git_result.returncode != 0:
+            await self._remove_from_registry(name)
             shutil.rmtree(clone_dir, ignore_errors=True)
             return f"Error: git clone failed: {git_result.stderr[-500:]}"
 
@@ -201,6 +240,7 @@ class CloneTools(Toolkit):
 
         compose_path = clone_dir / "docker-compose.yml"
         if not compose_path.exists():
+            await self._remove_from_registry(name)
             shutil.rmtree(clone_dir)
             return "Error: No docker-compose.yml found."
 
@@ -208,15 +248,25 @@ class CloneTools(Toolkit):
         # Swap only the port numbers — preserve the ${BIND_HOST:-127.0.0.1}
         # prefix so clones inherit the parent's binding (localhost-only by
         # default, Tailscale if BIND_HOST is set). NEVER fall back to 0.0.0.0.
-        compose = re.sub(r':8000:8000"', f':{port_b}:8000"', compose)
-        compose = re.sub(r':3000:5173"', f':{port_f}:5173"', compose)
+        b_pattern = r':8000:8000"'
+        f_pattern = r':3000:5173"'
+        if not re.search(b_pattern, compose):
+            await self._remove_from_registry(name)
+            shutil.rmtree(clone_dir)
+            return f"Error: Backend port pattern '{b_pattern}' not found in docker-compose.yml."
+        if not re.search(f_pattern, compose):
+            await self._remove_from_registry(name)
+            shutil.rmtree(clone_dir)
+            return f"Error: Frontend port pattern '{f_pattern}' not found in docker-compose.yml."
+        compose = re.sub(b_pattern, f':{port_b}:8000"', compose)
+        compose = re.sub(f_pattern, f':{port_f}:5173"', compose)
         # Strip bind-mount volumes — in Docker-in-Docker, bind mounts resolve
         # to host paths, not container paths, so they overlay the COPY-baked
         # code with empty host dirs. Remove relative bind mounts so clones use
         # only code baked into the image. Keep /var/run/docker.sock (absolute
         # host path — always valid) and anonymous volumes (node_modules etc).
         compose = re.sub(
-            r"^\s*-\s+\.(?=:|/)",
+            r'''^\s*-\s+["']?\.(?=:|/|["'])''',
             "# bind-mount stripped (DinD): ",
             compose,
             flags=re.MULTILINE,
@@ -226,15 +276,16 @@ class CloneTools(Toolkit):
 
         result = await self._compose_up(clone_dir, name)
         if result.returncode != 0:
+            await self._remove_from_registry(name)
             shutil.rmtree(clone_dir, ignore_errors=True)
             return f"Error: Failed to start clone: {result.stderr[-500:]}"
 
-        registry.append({
-            "name": name,
-            "ports": {"backend": port_b, "frontend": port_f},
-            "status": "running",
-        })
-        self._save_registry(registry)
+        async with self._lock:
+            registry = self._load_registry()
+            for c in registry:
+                if c["name"] == name:
+                    c["status"] = "running"
+            self._save_registry(registry)
 
         return (
             f"Clone '{name}' is running!\n"
@@ -242,6 +293,13 @@ class CloneTools(Toolkit):
             f"   Frontend: http://localhost:{port_f}\n"
             f"   The clone has its own database and can spawn its own clones."
         )
+
+    async def _remove_from_registry(self, name: str) -> None:
+        """Thread-safe removal of a clone from the registry."""
+        async with self._lock:
+            registry = self._load_registry()
+            registry = [c for c in registry if c["name"] != name]
+            self._save_registry(registry)
 
     async def list_clones(self) -> str:
         """List all clones with their ports and status."""
@@ -255,7 +313,6 @@ class CloneTools(Toolkit):
                 c["status"] = "running" if ps.returncode == 0 and ps.stdout.strip() else "stopped"
             except Exception:
                 c["status"] = "unknown"
-        self._save_registry(registry)
 
         lines = [f"{'Name':<20} {'Backend':<8} {'Frontend':<9} {'Status':<10}", "-" * 50]
         for c in registry:
