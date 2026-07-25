@@ -301,10 +301,14 @@ class CloneTools(Toolkit):
             return f"Error: Clone '{name}' not found."
         errors = []
         try:
-            await self._compose_cmd(name, "down", "-v")
+            await self._compose_cmd(name, "down", "-v", "--rmi", "local")
         except Exception as e:
             errors.append(f"container shutdown: {e}")
-        shutil.rmtree(_CLONES_DIR / name, ignore_errors=True)
+        clone_dir = _CLONES_DIR / name
+        try:
+            shutil.rmtree(clone_dir)
+        except Exception as e:
+            errors.append(f"file removal: {e}")
         # Always remove from registry, even if containers/files failed
         registry = [c for c in registry if c["name"] != name]
         self._save_registry(registry)
