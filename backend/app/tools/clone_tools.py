@@ -69,15 +69,33 @@ class CloneTools(Toolkit):
 
     @staticmethod
     def _port_in_use(port: int) -> bool:
-        """Check if a port is already bound by a running container."""
+        """Check if a port is already bound by a running container OR on the host.
+
+        Docker-in-Docker means our docker ps shows host containers, but a
+        socket test catches non-Docker listeners too (e.g. dev servers,
+        databases, or orphaned processes).
+        """
+        # 1. Check docker containers
         try:
             r = subprocess.run(
                 ["docker", "ps", "--format", "{{.Ports}}"],
                 capture_output=True, text=True, timeout=10,
             )
-            return f":{port}->" in r.stdout
+            if f":{port}->" in r.stdout:
+                return True
         except Exception:
+            pass
+        # 2. Check host-level socket binding
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        try:
+            s.bind(("0.0.0.0", port))
+            s.close()
             return False
+        except OSError:
+            s.close()
+            return True
 
     @staticmethod
     def _next_ports(registry: list[dict]) -> tuple[int, int]:
@@ -262,6 +280,23 @@ class CloneTools(Toolkit):
                     if k not in _SYS_ENV
                 ]
                 env_dst.write_text("\n".join(lines_env) + "\n")
+
+        # Overwrite port assignments in .env. The parent's .env has the
+        # parent's ports (e.g. 8001/3001), and .env values override the
+        # compose file defaults — so without this, the clone tries to bind
+        # the SAME ports as the parent and fails with "port already allocated".
+        env_file = clone_dir / ".env"
+        if env_file.exists():
+            env_text = env_file.read_text()
+            if re.search(r'(?m)^BACKEND_PORT=', env_text):
+                env_text = re.sub(r'(?m)^BACKEND_PORT=.*', f'BACKEND_PORT={port_b}', env_text)
+            else:
+                env_text += f'\nBACKEND_PORT={port_b}\n'
+            if re.search(r'(?m)^FRONTEND_PORT=', env_text):
+                env_text = re.sub(r'(?m)^FRONTEND_PORT=.*', f'FRONTEND_PORT={port_f}', env_text)
+            else:
+                env_text += f'\nFRONTEND_PORT={port_f}\n'
+            env_file.write_text(env_text)
 
         compose_path = clone_dir / "docker-compose.yml"
         if not compose_path.exists():
