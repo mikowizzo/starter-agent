@@ -35,9 +35,19 @@ _CLONE_REPO = "https://github.com/mikowizzo/starter-agent.git"
 # alphanumeric.
 _NAME_RE = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
 
+# Compose projects owned by the host/parent — never touched by GC.
+# The parent stack is "repo" (compose sets project name from cwd basename).
+# Extend this set if the host runs other non-clone compose stacks.
+_PROTECTED_PROJECTS = {
+    os.environ.get("CLONE_NAME", "repo"),       # this agent's own stack
+    "miko",                                       # the orchestrator
+    "eva",                                        # other host stacks
+    "ibgateway", "ib_gateway",
+}
+
 
 class CloneTools(Toolkit):
-    """Create, list, stop, start, and destroy clones of this agent."""
+    """Create, list, stop, start, destroy, and garbage-collect clones."""
 
     def __init__(self) -> None:
         super().__init__(
@@ -48,9 +58,14 @@ class CloneTools(Toolkit):
                 self.stop_clone,
                 self.start_clone,
                 self.destroy_clone,
+                self.gc_orphans,
             ],
         )
         self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Registry helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _load_registry() -> list[dict]:
@@ -66,6 +81,17 @@ class CloneTools(Toolkit):
     def _save_registry(clones: list[dict]) -> None:
         _CLONES_DIR.mkdir(parents=True, exist_ok=True)
         _REGISTRY.write_text(json.dumps(clones, indent=2))
+
+    async def _remove_from_registry(self, name: str) -> None:
+        """Thread-safe removal of a clone from the registry."""
+        async with self._lock:
+            registry = self._load_registry()
+            registry = [c for c in registry if c["name"] != name]
+            self._save_registry(registry)
+
+    # ------------------------------------------------------------------
+    # Docker helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _port_in_use(port: int) -> bool:
@@ -132,15 +158,6 @@ class CloneTools(Toolkit):
             return None
 
     @staticmethod
-    async def _compose_up(clone_dir: Path, name: str) -> subprocess.CompletedProcess:
-        return await asyncio.to_thread(
-            subprocess.run,
-            ["docker", "compose", "-p", name, "up", "--build", "-d"],
-            capture_output=True, text=True, timeout=300,
-            cwd=str(clone_dir),
-        )
-
-    @staticmethod
     async def _docker_check() -> tuple[bool, str]:
         """Check docker access. Returns (ok, message).
 
@@ -172,7 +189,7 @@ class CloneTools(Toolkit):
             return False, (
                 "Permission denied on the Docker socket. The container's docker "
                 "group GID does not match the host's. Rebuild the image with "
-                "--build-arg DOCKER_GID=$(getent group docker | cut -d: -f3)."
+                "--build-arg DOCKER_GID=$(getent group docker | cut -d: -3)."
             )
         if "cannot connect" in err or "no such file" in err:
             return False, (
@@ -188,14 +205,90 @@ class CloneTools(Toolkit):
         return ok
 
     @staticmethod
-    async def _compose_cmd(name: str, *args: str) -> subprocess.CompletedProcess:
+    async def _compose_cmd(name: str, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
         clone_dir = _CLONES_DIR / name
         return await asyncio.to_thread(
             subprocess.run,
             ["docker", "compose", "-p", name, *args],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=timeout,
             cwd=str(clone_dir),
         )
+
+    @staticmethod
+    async def _compose_up(clone_dir: Path, name: str, port_b: int, port_f: int) -> subprocess.CompletedProcess:
+        return await asyncio.to_thread(
+            subprocess.run,
+            ["docker", "compose", "-p", name, "up", "--build", "-d"],
+            capture_output=True, text=True, timeout=300,
+            env={**os.environ, "BACKEND_PORT": str(port_b), "FRONTEND_PORT": str(port_f)},
+            cwd=str(clone_dir),
+        )
+
+    # ------------------------------------------------------------------
+    # GC primitive — label-scoped teardown (works even after dir is gone)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _sweep_project(name: str) -> list[str]:
+        """Force-remove ALL docker artifacts for a compose project by label.
+
+        Works even after the clone directory has been deleted, because it
+        queries the Docker daemon directly via compose project labels.
+        Idempotent — if nothing exists, returns empty list. Never raises.
+        """
+        errors: list[str] = []
+        label = f"label=com.docker.compose.project={name}"
+
+        async def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
+            return await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=timeout
+            )
+
+        for ls_cmd, rm_cmd, kind in [
+            (["docker", "ps", "-aq", "--filter", label], ["docker", "rm", "-f"], "container"),
+            (["docker", "images", "-aq", "--filter", label], ["docker", "rmi", "-f"], "image"),
+            (["docker", "volume", "ls", "-q", "--filter", label], ["docker", "volume", "rm"], "volume"),
+            (["docker", "network", "ls", "-q", "--filter", label], ["docker", "network", "rm"], "network"),
+        ]:
+            try:
+                ids = (await _run(ls_cmd)).stdout.split()
+                if ids:
+                    r = await _run(rm_cmd + ids)
+                    if r.returncode != 0 and r.stderr.strip():
+                        errors.append(f"{kind}: {r.stderr.strip()[:200]}")
+            except Exception as e:
+                errors.append(f"{kind}: {e}")
+
+        return errors
+
+    @staticmethod
+    async def _safe_teardown(clone_dir: Path, name: str) -> None:
+        """Best-effort Docker teardown for a failed create or destroy.
+
+        Tries `docker compose down` first (graceful, removes volumes/images).
+        Falls back to label-based force removal if the directory is gone or
+        compose down fails. Never raises — caller handles errors.
+        """
+        # Try compose down first (graceful path)
+        if clone_dir.exists():
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["docker", "compose", "-p", name, "down", "-v",
+                     "--rmi", "local", "--remove-orphans"],
+                    capture_output=True, text=True, timeout=60,
+                    cwd=str(clone_dir),
+                )
+            except Exception:
+                pass  # Fall through to label sweep
+
+        # Always run label sweep as a backstop — catches anything compose
+        # down missed, and works even if the directory is already gone.
+        await CloneTools._sweep_project(name)
+
+    # ------------------------------------------------------------------
+    # Public tools
+    # ------------------------------------------------------------------
 
     async def create_clone(self, name: str) -> str:
         """Create a clone of this agent.
@@ -300,8 +393,9 @@ class CloneTools(Toolkit):
 
         compose_path = clone_dir / "docker-compose.yml"
         if not compose_path.exists():
+            await self._safe_teardown(clone_dir, name)
             await self._remove_from_registry(name)
-            shutil.rmtree(clone_dir)
+            shutil.rmtree(clone_dir, ignore_errors=True)
             return "Error: No docker-compose.yml found."
 
         compose = compose_path.read_text()
@@ -313,13 +407,16 @@ class CloneTools(Toolkit):
         b_pattern = r':(\$\{BACKEND_PORT:-)?8000\}?:8000"'
         f_pattern = r':(\$\{FRONTEND_PORT:-)?3000\}?:5173"'
         if not re.search(b_pattern, compose):
+            await self._safe_teardown(clone_dir, name)
             await self._remove_from_registry(name)
-            shutil.rmtree(clone_dir)
-            return f"Error: Backend port pattern not found in docker-compose.yml."
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            return "Error: Backend port pattern not found in docker-compose.yml."
         if not re.search(f_pattern, compose):
+            await self._safe_teardown(clone_dir, name)
             await self._remove_from_registry(name)
-            shutil.rmtree(clone_dir)
-            return f"Error: Frontend port pattern not found in docker-compose.yml."
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            return "Error: Frontend port pattern not found in docker-compose.yml."
+
         # Replace the port number in both patterns
         compose = re.sub(
             r'BACKEND_PORT:-(\d+)}',
@@ -334,6 +431,7 @@ class CloneTools(Toolkit):
         # Also handle old hardcoded format (fallback)
         compose = re.sub(r':8000:8000"', f':{port_b}:8000"', compose)
         compose = re.sub(r':3000:5173"', f':{port_f}:5173"', compose)
+
         # Rewrite bind-mount volumes to absolute host paths.
         # In Docker-in-Docker, relative bind mounts (./backend, ./frontend)
         # resolve against the HOST filesystem, not the container — so they
@@ -349,7 +447,7 @@ class CloneTools(Toolkit):
                 return f"{m.group(1)}{host_path}{m.group(4)}"
 
             compose = re.sub(
-                r'(\s*-\s+)(["\']?)(\.{1,2}/[^:\s]+)(:)',
+                r'(\s*-\s+)(["\']?)(\.{1,2}(?:/[^:\s]+)?)(:)',
                 _rewrite_mount,
                 compose,
                 flags=re.MULTILINE,
@@ -365,8 +463,11 @@ class CloneTools(Toolkit):
 
         compose_path.write_text(compose)
 
-        result = await self._compose_up(clone_dir, name)
+        result = await self._compose_up(clone_dir, name, port_b, port_f)
         if result.returncode != 0:
+            # LAYER 1: Full teardown before removing dir/registry.
+            # Stops the leak at the source — no orphaned containers/images.
+            await self._safe_teardown(clone_dir, name)
             await self._remove_from_registry(name)
             shutil.rmtree(clone_dir, ignore_errors=True)
             return f"Error: Failed to start clone: {result.stderr[-500:]}"
@@ -385,15 +486,11 @@ class CloneTools(Toolkit):
             f"   The clone has its own database and can spawn its own clones."
         )
 
-    async def _remove_from_registry(self, name: str) -> None:
-        """Thread-safe removal of a clone from the registry."""
-        async with self._lock:
-            registry = self._load_registry()
-            registry = [c for c in registry if c["name"] != name]
-            self._save_registry(registry)
-
     async def list_clones(self) -> str:
         """List all clones with their ports and status."""
+        # GC on read: cheap insurance that catches orphans between explicit calls
+        await self.gc_orphans()
+
         registry = self._load_registry()
         if not registry:
             return "No clones yet. Use create_clone to make one."
@@ -442,24 +539,172 @@ class CloneTools(Toolkit):
         return f"Clone '{name}' started."
 
     async def destroy_clone(self, name: str) -> str:
-        """Destroy a clone — stops containers, removes code and data permanently."""
+        """Destroy a clone — stops containers, removes code and data permanently.
+
+        If Docker teardown fails (timeout, daemon error), the clone is marked
+        as 'zombie' in the registry. The gc_orphans tool will retry cleanup
+        later. This prevents orphaned resources from accumulating silently.
+        """
         name = name.strip().lower()
         registry = self._load_registry()
-        if not any(c["name"] == name for c in registry):
+        clone = next((c for c in registry if c["name"] == name), None)
+        if not clone:
             return f"Error: Clone '{name}' not found."
+
         errors = []
-        try:
-            await self._compose_cmd(name, "down", "-v", "--rmi", "local")
-        except Exception as e:
-            errors.append(f"container shutdown: {e}")
         clone_dir = _CLONES_DIR / name
+
+        # Retry compose down up to 3 times with increasing timeout
+        down_ok = False
+        for attempt in range(3):
+            timeout = 60 + attempt * 30  # 60s, 90s, 120s
+            try:
+                r = await self._compose_cmd(
+                    name, "down", "-v", "--rmi", "local", "--remove-orphans",
+                    timeout=timeout,
+                )
+                if r.returncode == 0:
+                    down_ok = True
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(2)
+            except subprocess.TimeoutExpired:
+                if attempt < 2:
+                    await asyncio.sleep(2)
+            except Exception as e:
+                errors.append(f"compose down: {e}")
+                break
+
+        # Label-based backstop — catches anything compose down missed
+        sweep_errors = await self._sweep_project(name)
+        errors.extend(sweep_errors)
+
+        if down_ok and not sweep_errors:
+            # Clean teardown — remove from registry and delete dir
+            registry = [c for c in registry if c["name"] != name]
+            self._save_registry(registry)
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            return f"Clone '{name}' destroyed."
+        elif errors:
+            # Partial failure — mark as zombie, keep registry entry for GC retry
+            clone["status"] = "zombie"
+            self._save_registry(registry)
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            return (
+                f"Clone '{name}' partially destroyed — marked as zombie. "
+                f"Warnings: {'; '.join(errors)}. Run gc_orphans to finish cleanup."
+            )
+        else:
+            # compose down said success but sweep found leftovers
+            registry = [c for c in registry if c["name"] != name]
+            self._save_registry(registry)
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            return f"Clone '{name}' destroyed."
+
+    # ------------------------------------------------------------------
+    # Layer 3: Reconciler GC
+    # ------------------------------------------------------------------
+
+    async def gc_orphans(self) -> str:
+        """Garbage-collect orphaned Docker resources from failed clone operations.
+
+        Scans for compose projects, containers, and images that exist in Docker
+        but are NOT tracked in the clone registry — then removes them. Also
+        retries cleanup of any clones marked as 'zombie' (destroyed but not
+        fully cleaned up).
+
+        Safe to call anytime. Never touches running containers, registered
+        clones, or protected host stacks.
+
+        Returns:
+            A summary of what was cleaned up.
+        """
+        registry = self._load_registry()
+        registry_names = {c["name"] for c in registry}
+        registry_names_with_pending = {
+            c["name"] for c in registry
+            if c.get("status") == "pending"
+        }
+        removed: list[str] = []
+
+        # --- 1. Retry zombie clones ---
+        zombies = [c for c in registry if c.get("status") == "zombie"]
+        for z in zombies:
+            errors = await self._sweep_project(z["name"])
+            if errors:
+                removed.append(f"zombie {z['name']}: {len(errors)} errors remain")
+            else:
+                registry = [c for c in registry if c["name"] != z["name"]]
+                removed.append(f"zombie {z['name']}: cleaned")
+
+        if zombies:
+            self._save_registry(registry)
+
+        # --- 2. Find orphaned compose projects ---
+        # List all containers and extract their compose project labels.
+        # Any project NOT in the registry and NOT protected is an orphan.
         try:
-            shutil.rmtree(clone_dir)
-        except Exception as e:
-            errors.append(f"file removal: {e}")
-        # Always remove from registry, even if containers/files failed
-        registry = [c for c in registry if c["name"] != name]
-        self._save_registry(registry)
-        if errors:
-            return f"Clone '{name}' destroyed (with warnings: {'; '.join(errors)})."
-        return f"Clone '{name}' destroyed."
+            r = await asyncio.to_thread(
+                subprocess.run,
+                ["docker", "ps", "-a", "--format",
+                 "{{.Label \"com.docker.compose.project\"}}"],
+                capture_output=True, text=True, timeout=15,
+            )
+            all_projects = {
+                p.strip() for p in r.stdout.splitlines()
+                if p.strip() and p.strip() != "default"
+            }
+        except Exception:
+            all_projects = set()
+
+        orphaned_projects = all_projects - registry_names - _PROTECTED_PROJECTS
+
+        for proj in orphaned_projects:
+            # Skip if any container in this project is currently running
+            # (could be a clone that's mid-creation or manually started)
+            try:
+                ps = await asyncio.to_thread(
+                    subprocess.run,
+                    ["docker", "ps", "--filter", f"label=com.docker.compose.project={proj}",
+                     "--format", "{{.ID}}"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if ps.stdout.strip():
+                    continue  # Something is still running, don't touch it
+            except Exception:
+                continue
+
+            errors = await self._sweep_project(proj)
+            if errors:
+                removed.append(f"orphan {proj}: partial ({len(errors)} errors)")
+            else:
+                removed.append(f"orphan {proj}: cleaned")
+
+            # Remove orphaned clone directory if it exists
+            orphan_dir = _CLONES_DIR / proj
+            if orphan_dir.exists():
+                shutil.rmtree(orphan_dir, ignore_errors=True)
+
+        # --- 3. Prune dangling images (safe — they're unreferenced by definition) ---
+        try:
+            r = await asyncio.to_thread(
+                subprocess.run,
+                ["docker", "image", "prune", "-f"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode == 0:
+                # Parse "Total reclaimed space: 811MB" if present
+                for line in r.stdout.splitlines():
+                    if "reclaimed" in line.lower():
+                        removed.append(f"images: {line.strip()}")
+                        break
+                else:
+                    # Only report if something was actually pruned
+                    if "deleted" in r.stdout.lower() or "total" in r.stdout.lower():
+                        removed.append("images: dangling pruned")
+        except Exception:
+            pass  # Non-critical
+
+        if not removed:
+            return "GC: nothing to clean up."
+        return "GC complete:\n  - " + "\n  - ".join(removed)
