@@ -89,6 +89,27 @@ class CloneTools(Toolkit):
         return b, f
 
     @staticmethod
+    def _host_workspace_dir() -> str | None:
+        """Detect the host path that maps to /workspace in this container.
+
+        Uses `docker inspect` on ourselves to read the bind mount.
+        Returns the absolute host path or None if not found.
+        """
+        hostname = os.environ.get("HOSTNAME", "")
+        if not hostname:
+            return None
+        try:
+            r = subprocess.run(
+                ["docker", "inspect", hostname,
+                 '--format', '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}'],
+                capture_output=True, text=True, timeout=10,
+            )
+            path = r.stdout.strip()
+            return path or None
+        except Exception:
+            return None
+
+    @staticmethod
     async def _compose_up(clone_dir: Path, name: str) -> subprocess.CompletedProcess:
         return await asyncio.to_thread(
             subprocess.run,
@@ -260,17 +281,34 @@ class CloneTools(Toolkit):
             return f"Error: Frontend port pattern '{f_pattern}' not found in docker-compose.yml."
         compose = re.sub(b_pattern, f':{port_b}:8000"', compose)
         compose = re.sub(f_pattern, f':{port_f}:5173"', compose)
-        # Strip bind-mount volumes — in Docker-in-Docker, bind mounts resolve
-        # to host paths, not container paths, so they overlay the COPY-baked
-        # code with empty host dirs. Remove relative bind mounts so clones use
-        # only code baked into the image. Keep /var/run/docker.sock (absolute
-        # host path — always valid) and anonymous volumes (node_modules etc).
-        compose = re.sub(
-            r'''^\s*-\s+["']?\.(?=:|/|["'])''',
-            "# bind-mount stripped (DinD): ",
-            compose,
-            flags=re.MULTILINE,
-        )
+        # Rewrite bind-mount volumes to absolute host paths.
+        # In Docker-in-Docker, relative bind mounts (./backend, ./frontend)
+        # resolve against the HOST filesystem, not the container — so they
+        # point to wrong/empty directories. Instead of stripping them (which
+        # kills HMR), detect our own host workspace path and rewrite relative
+        # mounts to absolute host paths. This preserves live file watching.
+        host_ws = self._host_workspace_dir()
+        if host_ws:
+            def _rewrite_mount(m):
+                # m.group(3) is the relative path like ./frontend or ./.env
+                clean = m.group(3).strip("'").strip('"')
+                host_path = str(Path(host_ws) / clean)
+                return f"{m.group(1)}{host_path}{m.group(4)}"
+
+            compose = re.sub(
+                r'(\s*-\s+)(["\']?)(\.{1,2}/[^:\s]+)(:)',
+                _rewrite_mount,
+                compose,
+                flags=re.MULTILINE,
+            )
+        else:
+            # Fallback: strip bind mounts if we can't detect host path
+            compose = re.sub(
+                r'^\s*-\s+["\']?\.(?=:|/|["\'])',
+                "# bind-mount stripped (DinD): ",
+                compose,
+                flags=re.MULTILINE,
+            )
 
         compose_path.write_text(compose)
 

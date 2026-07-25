@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     ports:
-      - "${BIND_HOST:-127.0.0.1}:8000:8000"
+      - "${BIND_HOST:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
     volumes:
       - .:/workspace
       - /var/run/docker.sock:/var/run/docker.sock
@@ -35,7 +35,7 @@ services:
     build:
       context: ./frontend
     ports:
-      - "${BIND_HOST:-127.0.0.1}:3000:5173"
+      - "${BIND_HOST:-127.0.0.1}:${FRONTEND_PORT:-3000}:5173"
     volumes:
       - ./frontend:/workspace/frontend
       - /workspace/frontend/node_modules
