@@ -1,5 +1,11 @@
 FROM python:3.12-slim
 
+# Host docker group GID — the socket is mounted root:docker mode 660, so
+# appuser must be in a group whose GID matches the host docker group.
+# Build with: --build-arg DOCKER_GID=$(getent group docker | cut -d: -f3)
+# Defaults to 124 (common on Debian/Ubuntu). Override for your host.
+ARG DOCKER_GID=124
+
 COPY --from=ghcr.io/astral-sh/uv:0.6.14 /uv /bin/uv
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,9 +30,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r requirements.txt
+COPY . .
 
 RUN groupadd -g 1000 appuser && \
     useradd -m -u 1000 -g appuser appuser && \
+    groupadd -g ${DOCKER_GID} docker && \
+    usermod -aG docker appuser && \
     chown -R appuser:appuser /workspace
 USER appuser
 

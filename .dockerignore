@@ -1,0 +1,9 @@
+.clones/
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
+.ruff_cache/
+*.db

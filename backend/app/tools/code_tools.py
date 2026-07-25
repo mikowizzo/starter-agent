@@ -40,8 +40,7 @@ class CodeTools(Toolkit):
         except ValueError as e:
             return f"❌ {e}"
 
-    @staticmethod
-    def grep(*args: str) -> str:
+    def _rg(self, args: list[str]) -> str:
         """Run ripgrep.
 
         Returns stdout on success (including rg's exit-1 "no matches"),
