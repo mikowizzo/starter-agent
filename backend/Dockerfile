@@ -27,10 +27,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/workspace/backend
 
-COPY requirements.txt ./
+COPY backend/requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r requirements.txt
-COPY . .
+
+# Copy the full codebase — both backend and frontend — so the agent can
+# read/edit frontend files even when bind mounts are stripped (DinD clones).
+COPY backend/ ./
+COPY frontend/ /workspace/frontend/
 
 RUN groupadd -g 1000 appuser && \
     useradd -m -u 1000 -g appuser appuser && \

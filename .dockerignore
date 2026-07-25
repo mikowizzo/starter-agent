@@ -1,9 +1,11 @@
 .clones/
+.git/
 node_modules/
-__pycache__/
+**/__pycache__/
 *.pyc
 .venv/
 venv/
-.git/
 .ruff_cache/
 *.db
+.env
+.agno/
