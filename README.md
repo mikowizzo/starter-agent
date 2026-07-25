@@ -43,6 +43,33 @@ Open **http://localhost:3000** in your browser. That's it.
 
 ---
 
+## Secure remote access with Tailscale (recommended)
+
+By default, the agent only listens on `localhost` — nobody else can reach it.
+To access it from your phone, laptop, or other devices **without exposing it to
+the public internet**, use [Tailscale](https://tailscale.com):
+
+**1. Install Tailscale** on this machine and any device you want to access from.
+
+**2. Find your machine's Tailscale IP** (starts with `100.x.y.z`):
+
+```bash
+tailscale ip -4
+```
+
+**3. Set the bind host** in your `.env`:
+
+```bash
+BIND_HOST=100.x.y.z    # your Tailscale IP from step 2
+```
+
+**4. Restart and open** `http://100.x.y.z:3000` from any device on your tailnet.
+
+The agent binds only to your Tailscale interface — it is invisible to the public
+internet. For more, see the [Tailscale getting started guide](https://tailscale.com/kb/1017/install).
+
+---
+
 ## Make it yours
 
 | Want to change... | Open this file... |
