@@ -12,6 +12,10 @@ services:
       - .env
     environment:
       - ENVIRONMENT=development
+    # Docker socket GID is supplied at runtime, not bake-time.
+    # Find yours: getent group docker | cut -d: -f3
+    group_add:
+      - "${DOCKER_GID:-124}"
     healthcheck:
       test:
         [
