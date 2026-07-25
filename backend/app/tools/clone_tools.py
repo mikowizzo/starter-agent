@@ -269,18 +269,32 @@ class CloneTools(Toolkit):
         # Swap only the port numbers — preserve the ${BIND_HOST:-127.0.0.1}
         # prefix so clones inherit the parent's binding (localhost-only by
         # default, Tailscale if BIND_HOST is set). NEVER fall back to 0.0.0.0.
-        b_pattern = r':8000:8000"'
-        f_pattern = r':3000:5173"'
+        # Handle both old hardcoded format (:8000:8000") and new variable
+        # format (:${BACKEND_PORT:-8000}:8000").
+        b_pattern = r':(\$\{BACKEND_PORT:-)?8000\}?:8000"'
+        f_pattern = r':(\$\{FRONTEND_PORT:-)?3000\}?:5173"'
         if not re.search(b_pattern, compose):
             await self._remove_from_registry(name)
             shutil.rmtree(clone_dir)
-            return f"Error: Backend port pattern '{b_pattern}' not found in docker-compose.yml."
+            return f"Error: Backend port pattern not found in docker-compose.yml."
         if not re.search(f_pattern, compose):
             await self._remove_from_registry(name)
             shutil.rmtree(clone_dir)
-            return f"Error: Frontend port pattern '{f_pattern}' not found in docker-compose.yml."
-        compose = re.sub(b_pattern, f':{port_b}:8000"', compose)
-        compose = re.sub(f_pattern, f':{port_f}:5173"', compose)
+            return f"Error: Frontend port pattern not found in docker-compose.yml."
+        # Replace the port number in both patterns
+        compose = re.sub(
+            r'BACKEND_PORT:-(\d+)}',
+            f'BACKEND_PORT:-{port_b}}}',
+            compose,
+        )
+        compose = re.sub(
+            r'FRONTEND_PORT:-(\d+)}',
+            f'FRONTEND_PORT:-{port_f}}}',
+            compose,
+        )
+        # Also handle old hardcoded format (fallback)
+        compose = re.sub(r':8000:8000"', f':{port_b}:8000"', compose)
+        compose = re.sub(r':3000:5173"', f':{port_f}:5173"', compose)
         # Rewrite bind-mount volumes to absolute host paths.
         # In Docker-in-Docker, relative bind mounts (./backend, ./frontend)
         # resolve against the HOST filesystem, not the container — so they
