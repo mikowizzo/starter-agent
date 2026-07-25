@@ -205,10 +205,11 @@ class CloneTools(Toolkit):
             return "Error: No docker-compose.yml found."
 
         compose = compose_path.read_text()
-        compose = re.sub(r'"127\.0\.0\.1:8000:8000"', f'"0.0.0.0:{port_b}:8000"', compose)
-        compose = re.sub(r'"127\.0\.0\.1:3000:5173"', f'"0.0.0.0:{port_f}:5173"', compose)
-        compose = re.sub(r'"8000:8000"', f'"0.0.0.0:{port_b}:8000"', compose)
-        compose = re.sub(r'"3000:5173"', f'"0.0.0.0:{port_f}:5173"', compose)
+        # Swap only the port numbers — preserve the ${BIND_HOST:-127.0.0.1}
+        # prefix so clones inherit the parent's binding (localhost-only by
+        # default, Tailscale if BIND_HOST is set). NEVER fall back to 0.0.0.0.
+        compose = re.sub(r':8000:8000"', f':{port_b}:8000"', compose)
+        compose = re.sub(r':3000:5173"', f':{port_f}:5173"', compose)
         # Strip bind-mount volumes — in Docker-in-Docker, bind mounts resolve
         # to host paths, not container paths, so they overlay the COPY-baked
         # code with empty host dirs. Remove relative bind mounts so clones use
