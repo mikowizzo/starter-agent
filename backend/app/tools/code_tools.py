@@ -2,9 +2,14 @@
 
 import ast
 import difflib
+import fcntl
+import functools
 import os
 import shutil
 import subprocess
+import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from agno.tools import Toolkit
@@ -14,12 +19,52 @@ _EXCLUDE_GLOBS = [f"!**/{d}/**" for d in _EXCLUDE_DIRS] + [
     f"!**/{d}" for d in _EXCLUDE_DIRS
 ]
 
+_EDIT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "starter-code-edit.lock")
+_EDIT_THREAD_LOCK = threading.Lock()
+
+
+@contextmanager
+def _edit_lock():
+    """Serialize file mutations across threads and processes.
+
+    edit/write each do a whole-file read-modify-write. When the model fires
+    several of them in parallel, their writes clobber each other and edits
+    silently vanish. Every mutator runs under this lock, so parallel calls
+    execute one at a time and each sees the latest file. The flock is
+    released by the kernel if the process dies (no stale locks).
+    """
+    with _EDIT_THREAD_LOCK:  # serialize same-process threads
+        fd = os.open(_EDIT_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)  # serialize across processes too
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def _serialized(fn):
+    """Wrap a mutating tool so its whole read-modify-write runs under the lock."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _edit_lock():
+            return fn(*args, **kwargs)
+
+    return wrapper
+
 
 class CodeTools(Toolkit):
     """Read, write, edit, grep, glob, delete, move."""
 
     def __init__(self, base_dir: str | None = None) -> None:
         self.base = Path(base_dir or ".").resolve()
+        # Mutators run under the edit lock: parallel calls would otherwise
+        # clobber each other's whole-file read-modify-write (lost updates).
+        # Wrap the attribute itself (not just the toolkit registration) so
+        # every call path — agno's dispatcher or direct — goes through it.
+        self.write = _serialized(self.write)
+        self.edit = _serialized(self.edit)
         super().__init__(
             name="code_tools",
             tools=[
