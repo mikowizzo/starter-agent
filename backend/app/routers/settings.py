@@ -1,8 +1,12 @@
 """Model settings — list, view, switch, and restart."""
 
+import json
 import os
+import re
+import subprocess
 import sys
 import threading
+from pathlib import Path
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -42,6 +46,58 @@ async def set_model(request: Request):
     new_model = make_model(model_key)
     request.app.state.team.model = new_model
     return {"current": model_key, **MODELS[model_key]}
+
+
+def _own_frontend_port() -> int:
+    """This instance's published frontend port.
+
+    Clones have FRONTEND_PORT in their .env (via env_file). The parent has no
+    .env, so fall back to inspecting our compose project's frontend container.
+    """
+    env_port = os.environ.get("FRONTEND_PORT", "")
+    if env_port.isdigit():
+        return int(env_port)
+    try:
+        project = subprocess.run(
+            ["docker", "inspect", os.environ.get("HOSTNAME", ""),
+             "--format", "{{index .Config.Labels \"com.docker.compose.project\"}}"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if project:
+            ports = subprocess.run(
+                ["docker", "ps",
+                 "--filter", f"label=com.docker.compose.project={project}",
+                 "--filter", "label=com.docker.compose.service=frontend",
+                 "--format", "{{.Ports}}"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+            m = re.search(r":(\d+)->", ports)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    return 3000
+
+
+@router.get("/clones")
+async def get_clones():
+    """This instance's frontend port plus all registered clones — powers the
+    bottombar instance switcher. Each container's /workspace/.clones/registry.json
+    is its own registry (clones keep their own), so this works on any instance.
+    """
+    clones: list = []
+    reg = Path("/workspace/.clones/registry.json")
+    if reg.exists():
+        try:
+            data = json.loads(reg.read_text())
+            if isinstance(data, list):
+                clones = data
+        except Exception:
+            pass
+    return {
+        "self_port": _own_frontend_port(),
+        "clones": clones,
+    }
 
 
 @router.post("/restart")

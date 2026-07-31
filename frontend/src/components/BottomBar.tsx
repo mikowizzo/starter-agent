@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { History, RotateCw } from "lucide-react";
 import { HistoryModal } from "./HistoryModal";
 import { ModelSelector } from "./ModelSelector";
-import { fetchModel } from "../lib/api";
+import { fetchModel, fetchClones, type CloneInfo } from "../lib/api";
 
 export function BottomBar({
   onNewChat,
@@ -18,6 +18,10 @@ export function BottomBar({
   const [showHistory, setShowHistory] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [switcher, setSwitcher] = useState<{
+    self_port: number;
+    clones: CloneInfo[];
+  } | null>(null);
 
   async function refreshModel() {
     const info = await fetchModel();
@@ -26,6 +30,7 @@ export function BottomBar({
 
   useEffect(() => {
     refreshModel();
+    fetchClones().then(setSwitcher);
   }, []);
 
   async function handleRestart() {
@@ -59,6 +64,15 @@ export function BottomBar({
       }
     }, 1000);
   }
+
+  const currentPort =
+    window.location.port ||
+    (window.location.protocol === "https:" ? "443" : "80");
+  // The instance we're viewing = the clone whose frontend port matches the
+  // URL we're on; if no clone matches, it's the self/parent pill.
+  const currentName =
+    switcher?.clones.find((c) => c.ports.frontend === Number(currentPort))
+      ?.name ?? "parent";
 
   return (
     <div className="relative pb-[calc(0.5rem+env(safe-area-inset-bottom,0px))]">
@@ -117,6 +131,53 @@ export function BottomBar({
           <History className="h-4 w-4" />
         </button>
       </div>
+
+      {/* Instance switcher — parent + running clones */}
+      {switcher && (
+        <div className="flex items-center gap-1.5 overflow-x-auto px-1 pb-1 scrollbar-thin">
+          <InstanceLink
+            name="parent"
+            port={switcher.self_port}
+            isCurrent={currentName === "parent"}
+          />
+          {switcher.clones
+            .filter((c) => c.status === "running")
+            .map((c) => (
+              <InstanceLink
+                key={c.name}
+                name={c.name}
+                port={c.ports.frontend}
+                isCurrent={c.name === currentName}
+              />
+            ))}
+        </div>
+      )}
     </div>
+  );
+}
+
+function InstanceLink({
+  name,
+  port,
+  isCurrent,
+}: {
+  name: string;
+  port: number;
+  isCurrent: boolean;
+}) {
+  const cls =
+    "rounded-md px-2 py-0.5 text-[10px] font-medium whitespace-nowrap transition " +
+    (isCurrent
+      ? "bg-[var(--color-accent)] text-[var(--color-bg)] cursor-default"
+      : "text-[var(--color-accent)] hover:bg-[var(--color-border)]/40 active:scale-[0.95]");
+  const href = `${window.location.protocol}//${window.location.hostname}:${port}`;
+  return isCurrent ? (
+    <span className={cls} title={`${name} — current instance`}>
+      {name}
+    </span>
+  ) : (
+    <a href={href} className={cls} title={`Open ${name} (${href})`}>
+      {name}
+    </a>
   );
 }

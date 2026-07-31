@@ -118,3 +118,24 @@ export async function setModel(model: string): Promise<ModelInfo | null> {
     return null;
   }
 }
+
+// ── Instance switcher (parent + clones) ──────────────────────────
+
+export interface CloneInfo {
+  name: string;
+  ports: { backend: number; frontend: number };
+  status: string;
+}
+
+export async function fetchClones(): Promise<{
+  self_port: number;
+  clones: CloneInfo[];
+} | null> {
+  try {
+    const res = await fetch("/settings/clones");
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
