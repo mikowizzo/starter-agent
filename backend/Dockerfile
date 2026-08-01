@@ -36,9 +36,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY --chown=appuser:appuser backend/ ./
 COPY --chown=appuser:appuser frontend/ /workspace/frontend/
 
-# SECURITY: The Docker socket is mounted at runtime via compose group_add,
-# granting effective host root. The non-root user defends against application
-# bugs, not a compromised agent.
-USER appuser
+# Entrypoint syncs installed packages with requirements.txt before booting.
+# This makes `docker restart` safe even when new packages were added to
+# requirements.txt since the last image build.
+COPY backend/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
+# Container starts as root so the entrypoint can run uv pip install --system,
+# then drops to appuser for the application process.
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "30"]
