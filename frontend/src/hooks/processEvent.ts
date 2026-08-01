@@ -11,6 +11,8 @@ import type {
   ToolCall,
   ReasoningSegment,
 } from "../types";
+import type { ActiveRun } from "../lib/session";
+import { updateActiveRunEventIndex } from "../lib/session";
 
 export type StreamState = {
   isReasoningActive: boolean;
@@ -32,8 +34,10 @@ export type ProcessEventDeps = {
   updateAssistant: (assistantId: number, updates: Partial<Message>) => void;
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   updateSessionId: (id: string | null) => void;
+  updateActiveRun: (run: ActiveRun | null) => void;
   sessionIdRef: { current: string | null };
   activeRunIdRef: { current: string | null };
+  currentUserMsg: { current: string };
 };
 
 export function makeProcessEvent(deps: ProcessEventDeps) {
@@ -44,8 +48,10 @@ export function makeProcessEvent(deps: ProcessEventDeps) {
     updateAssistant,
     setMessages,
     updateSessionId,
+    updateActiveRun,
     sessionIdRef,
     activeRunIdRef,
+    currentUserMsg,
   } = deps;
 
   // ── Reasoning segment helpers ──────────────────────────────
@@ -77,6 +83,25 @@ export function makeProcessEvent(deps: ProcessEventDeps) {
     );
   }
 
+  // ── Run persistence helpers ────────────────────────────────
+
+  function persistActiveRun(runId: string) {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    updateActiveRun({
+      runId,
+      sessionId: sid,
+      lastEventIndex: 0,
+      userMessage: currentUserMsg.current,
+      createdAt: Date.now(),
+    });
+  }
+
+  function clearRun() {
+    updateActiveRun(null);
+    activeRunIdRef.current = null;
+  }
+
   // ── Main event processor ────────────────────────────────────
 
   return function processEvent(
@@ -96,9 +121,15 @@ export function makeProcessEvent(deps: ProcessEventDeps) {
       updateSessionId(d.session_id);
     }
 
-    // Capture run_id
+    // Capture run_id (first event that carries it)
     if (!activeRunIdRef.current && typeof d.run_id === "string" && d.run_id) {
       activeRunIdRef.current = d.run_id;
+      persistActiveRun(d.run_id);
+    }
+
+    // Track event_index for reconnection
+    if (typeof d.event_index === "number") {
+      updateActiveRunEventIndex(d.event_index);
     }
 
     // ── Reasoning events ──────────────────────────────────
@@ -252,7 +283,7 @@ export function makeProcessEvent(deps: ProcessEventDeps) {
           },
         });
       }
-      activeRunIdRef.current = null;
+      clearRun();
     }
 
     // ── Error events ──────────────────────────────────────
@@ -261,7 +292,7 @@ export function makeProcessEvent(deps: ProcessEventDeps) {
       const errorContent = d.content || d.error || "Unknown error";
       appendContent(assistantId, `\n\nERROR: ${errorContent}`);
       updateAssistant(assistantId, { role: "error" });
-      activeRunIdRef.current = null;
+      clearRun();
     }
   };
 }

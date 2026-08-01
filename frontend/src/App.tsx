@@ -71,6 +71,7 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
     send,
     stopRun,
     setMessages,
+    activeRun,
     sessionId,
     setSessionId,
   } = stream;
@@ -80,7 +81,7 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
   const isNearBottomRef = useRef(true);
   const loadIdRef = useRef(0);
 
-  const hasActiveRun = loading;
+  const hasActiveRun = loading || !!activeRun;
 
   // ── Init ──────────────────────────────────────────────────────────
 
@@ -88,7 +89,9 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
     (async () => {
       try {
         await fetchTeamId();
-        if (sessionId) setMessages(await loadSessionHistory(sessionId));
+        if (!activeRun) {
+          if (sessionId) setMessages(await loadSessionHistory(sessionId));
+        }
       } finally {
         setLoadingHistory(false);
       }
@@ -136,7 +139,7 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
 
   const visibleMessages = messages.filter(isVisible);
   const lastMsg = visibleMessages.at(-1);
-  const lastUserMsg = visibleMessages.findLast((m) => m.role === "user");
+  const lastUserMsg = [...visibleMessages].reverse().find((m) => m.role === "user");
   const showThinking = hasActiveRun && lastMsg && !isActive(lastMsg);
 
   // ── Render ────────────────────────────────────────────────────────

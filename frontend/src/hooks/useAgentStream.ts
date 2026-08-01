@@ -5,16 +5,38 @@
  *   - processEvent    → maps agno SSE events to timeline mutations
  *   - sse.ts          → raw stream reading
  *
- * This hook owns session/run lifecycle and send/stop flows.
+ * This hook owns session/run lifecycle and send/stop flows, including
+ * reconnection: runs are started in background mode and their state is
+ * persisted to localStorage so a browser refresh can resume them.
  */
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import type { Message } from "../types";
-import { agnoSessionId, userId, setAgnoSessionId } from "../lib/session";
+import {
+  agnoSessionId,
+  userId,
+  getActiveRun,
+  setActiveRun,
+  setAgnoSessionId,
+} from "../lib/session";
+import type { ActiveRun } from "../lib/session";
 import { runBase } from "../lib/api";
 import { useMessages, MAX_MESSAGES } from "./useMessages";
 import { makeProcessEvent, newStreamState } from "./processEvent";
 import { readSSEStream } from "./sse";
+
+const RESUME_MAX_RETRIES = 2;
+const RESUME_DELAY_MS = 2000; // flat delay between retries
+
+function failAssistant(
+  id: number,
+  content: string,
+  updateAssistant: (id: number, patch: Partial<Message>) => void,
+  clearRun: () => void,
+) {
+  updateAssistant(id, { role: "error", content });
+  clearRun();
+}
 
 export function useAgentStream() {
   const {
@@ -26,22 +48,46 @@ export function useAgentStream() {
     patchTimelineTool,
   } = useMessages();
 
-  const [loading, setLoading] = useState(false);
-  const [sessionId, setSessionIdState] = useState<string | null>(
+  const [loading, setLoading] = useState(() => !!getActiveRun());
+  const [activeRun, setActiveRunState] = useState<ActiveRun | null>(() =>
+    getActiveRun(),
+  );
+  const [sessionId, setSessionId] = useState<string | null>(
     () => agnoSessionId,
   );
 
   // Keep localStorage in sync with reactive state
   const updateSessionId = useCallback((id: string | null) => {
     setAgnoSessionId(id);
-    setSessionIdState(id);
+    setSessionId(id);
+  }, []);
+
+  const updateActiveRun = useCallback((run: ActiveRun | null) => {
+    setActiveRun(run);
+    setActiveRunState(run);
   }, []);
 
   const abortRef = useRef<AbortController | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
+  const currentUserMsg = useRef("");
+
   // Refs that mirror reactive state, for use inside hot callbacks
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+
+  useEffect(() => {
+    const saved = getActiveRun();
+    if (saved) {
+      activeRunIdRef.current = saved.runId;
+    }
+  }, []);
+
+  // ── Clear run state ──────────────────────────────────────
+
+  const clearRun = useCallback(() => {
+    updateActiveRun(null);
+    activeRunIdRef.current = null;
+  }, [updateActiveRun]);
 
   // ── Event processor ──────────────────────────────────────
 
@@ -53,8 +99,10 @@ export function useAgentStream() {
       updateAssistant,
       setMessages,
       updateSessionId,
+      updateActiveRun,
       sessionIdRef,
       activeRunIdRef,
+      currentUserMsg,
     }),
     [
       appendTimeline,
@@ -63,6 +111,7 @@ export function useAgentStream() {
       updateAssistant,
       setMessages,
       updateSessionId,
+      updateActiveRun,
     ],
   );
 
@@ -80,12 +129,55 @@ export function useAgentStream() {
     [processEvent],
   );
 
+  // ── Resume with automatic retry ──────────────────────────
+
+  const resumeWithRetry = useCallback(
+    async (
+      assistantId: number,
+      state: ReturnType<typeof newStreamState>,
+      maxRetries = RESUME_MAX_RETRIES,
+    ): Promise<boolean> => {
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        const saved = getActiveRun();
+        if (!saved || !saved.runId) return false;
+
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, RESUME_DELAY_MS));
+        }
+
+        try {
+          const form = new FormData();
+          form.append("last_event_index", String(saved.lastEventIndex));
+          if (saved.sessionId) form.append("session_id", saved.sessionId);
+
+          const ac = new AbortController();
+          abortRef.current = ac;
+
+          const res = await fetch(`${runBase()}/runs/${saved.runId}/resume`, {
+            method: "POST",
+            body: form,
+            signal: ac.signal,
+          });
+
+          if (!res.ok || !res.body) return false;
+
+          await readStream(res.body.getReader(), assistantId, state);
+          return true;
+        } catch (err: any) {
+          if (err.name === "AbortError") throw err;
+        }
+      }
+      return false;
+    },
+    [readStream],
+  );
+
   // ── Stop run ─────────────────────────────────────────────
 
   const stopRun = useCallback(async () => {
     abortRef.current?.abort();
     const runId = activeRunIdRef.current;
-    activeRunIdRef.current = null;
+    clearRun();
     setLoading(false);
 
     if (runId) {
@@ -96,7 +188,7 @@ export function useAgentStream() {
         { method: "POST" },
       ).catch(() => {});
     }
-  }, []);
+  }, [clearRun]);
 
   // ── Send message ─────────────────────────────────────────
 
@@ -105,6 +197,8 @@ export function useAgentStream() {
       if (!text.trim() || loading) return;
 
       const msg = text.trim();
+      currentUserMsg.current = msg;
+
       const userMsg: Message = {
         id: Date.now(),
         role: "user",
@@ -128,6 +222,9 @@ export function useAgentStream() {
 
       const state = newStreamState();
 
+      const fail = (content: string) =>
+        failAssistant(assistantId, content, updateAssistant, clearRun);
+
       try {
         const form = new FormData();
         form.append("message", msg);
@@ -135,6 +232,10 @@ export function useAgentStream() {
         if (sessionIdRef.current)
           form.append("session_id", sessionIdRef.current);
         form.append("stream", "true");
+        // Run in background mode: the team keeps executing even if the
+        // SSE connection drops (browser refresh), and can be resumed.
+        form.append("background", "true");
+
         const res = await fetch(`${runBase()}/runs`, {
           method: "POST",
           body: form,
@@ -152,20 +253,95 @@ export function useAgentStream() {
 
         await readStream(res.body!.getReader(), assistantId, state);
       } catch (err: any) {
-        if (err.name !== "AbortError") {
-          updateAssistant(assistantId, {
-            role: "error",
-            content: `Connection error: ${err.message}`,
-          });
-          activeRunIdRef.current = null;
+        if (err.name === "AbortError") {
+          // Background runs survive disconnect
+        } else {
+          try {
+            const recovered = await resumeWithRetry(assistantId, state);
+            if (!recovered) {
+              fail("Connection lost and could not reconnect to the run.");
+            }
+          } catch (retryErr: any) {
+            if (retryErr.name !== "AbortError") {
+              fail("Connection lost and could not reconnect to the run.");
+            }
+          }
         }
       } finally {
         setLoading(false);
         abortRef.current = null;
       }
     },
-    [loading, readStream, updateAssistant, setMessages],
+    [
+      loading,
+      readStream,
+      resumeWithRetry,
+      updateAssistant,
+      clearRun,
+      setMessages,
+    ],
   );
+
+  // ── Reconnect (page load / tab reopen) ───────────────────
+
+  const reconnect = useCallback(async () => {
+    const saved = getActiveRun();
+    if (!saved) return;
+
+    const { sessionId: savedSessionId, userMessage } = saved;
+
+    if (!sessionIdRef.current && savedSessionId) {
+      updateSessionId(savedSessionId);
+    }
+
+    activeRunIdRef.current = saved.runId;
+    setLoading(true);
+
+    const assistantId = Date.now() + 1;
+    setMessages([
+      { id: Date.now(), role: "user", content: userMessage },
+      { id: assistantId, role: "assistant", content: "", timeline: [] },
+    ]);
+
+    const state = newStreamState();
+
+    try {
+      const recovered = await resumeWithRetry(assistantId, state);
+      if (!recovered) {
+        failAssistant(
+          assistantId,
+          "Could not reconnect to run — it may have completed or expired.",
+          updateAssistant,
+          clearRun,
+        );
+      }
+    } catch (err: any) {
+      if (err.name !== "AbortError") {
+        failAssistant(
+          assistantId,
+          `Reconnect error: ${err.message}`,
+          updateAssistant,
+          clearRun,
+        );
+      }
+    } finally {
+      setLoading(false);
+      abortRef.current = null;
+    }
+  }, [
+    resumeWithRetry,
+    updateAssistant,
+    updateSessionId,
+    clearRun,
+    setMessages,
+  ]);
+
+  useEffect(() => {
+    const saved = getActiveRun();
+    if (saved && saved.runId) {
+      reconnect();
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return {
     messages,
@@ -173,6 +349,7 @@ export function useAgentStream() {
     send,
     stopRun,
     setMessages,
+    activeRun,
     sessionId,
     setSessionId: updateSessionId,
   };
