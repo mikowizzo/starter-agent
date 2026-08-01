@@ -16,6 +16,8 @@ from pathlib import Path
 
 from agno.tools import Toolkit
 
+from app.routers.settings import _own_frontend_port
+
 _CLONES_DIR = Path("/workspace/.clones")
 _REGISTRY = _CLONES_DIR / "registry.json"
 _BASE_PORT_BACKEND = 8100
@@ -47,9 +49,9 @@ _PROTECTED_PROJECTS = {
 
 
 class CloneTools(Toolkit):
-    """Create, list, stop, start, destroy, and garbage-collect clones."""
+    """Create, list, stop, start, rebuild, destroy, and garbage-collect clones."""
 
-    def __init__(self) -> None:
+    def __init__(self, team_name: str = "") -> None:
         super().__init__(
             name="clone_tools",
             tools=[
@@ -57,11 +59,14 @@ class CloneTools(Toolkit):
                 self.list_clones,
                 self.stop_clone,
                 self.start_clone,
+                self.rebuild_clone,
+                self.rebuild_self,
                 self.destroy_clone,
                 self.gc_orphans,
             ],
         )
         self._lock = asyncio.Lock()
+        self._team_name = team_name
 
     # ------------------------------------------------------------------
     # Registry helpers
@@ -464,6 +469,16 @@ class CloneTools(Toolkit):
 
         compose_path.write_text(compose)
 
+        # Tell the clone who its parent is, so its instance switcher can link
+        # back to us. Read by /settings/clones on the clone's side.
+        try:
+            (clone_dir / "parent.json").write_text(json.dumps({
+                "name": self._team_name or "parent",
+                "frontend_port": _own_frontend_port(),
+            }))
+        except Exception:
+            pass  # Non-fatal — switcher just shows no parent pill
+
         result = await self._compose_up(clone_dir, name, port_b, port_f)
         if result.returncode != 0:
             # LAYER 1: Full teardown before removing dir/registry.
@@ -538,6 +553,62 @@ class CloneTools(Toolkit):
         clone["status"] = "running"
         self._save_registry(registry)
         return f"Clone '{name}' started."
+
+    async def rebuild_clone(self, name: str) -> str:
+        """Rebuild a clone's images and restart it.
+
+        Picks up changes baked into the image at build time (e.g. new deps in
+        requirements.txt) — docker compose start does NOT.
+        """
+        name = name.strip().lower()
+        registry = self._load_registry()
+        clone = next((c for c in registry if c["name"] == name), None)
+        if not clone:
+            return f"Error: Clone '{name}' not found."
+        result = await self._compose_cmd(name, "up", "--build", "-d", timeout=300)
+        if result.returncode != 0:
+            return f"Error: Rebuild failed: {result.stderr[-300:]}"
+        clone["status"] = "running"
+        self._save_registry(registry)
+        return f"Clone '{name}' rebuilt and restarted."
+
+    async def rebuild_self(self) -> str:
+        """Rebuild this agent's own backend image and swap the container.
+
+        New baked-in deps (requirements.txt) need a fresh image AND a container
+        replacement — but replacing our own container kills any process inside
+        it, including the compose CLI. So the rebuild runs in a detached helper
+        container (our own image, docker socket + workspace mounted, root) that
+        survives the swap and finishes the job. This process is replaced
+        mid-flight; reply to the user before the swap lands.
+        """
+        project = os.environ.get("CLONE_NAME", "repo")
+        host_ws = self._host_workspace_dir()
+        img = subprocess.run(
+            ["docker", "inspect", os.environ.get("HOSTNAME", ""),
+             "--format", "{{.Config.Image}}"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if not host_ws or not img:
+            return "Error: can't determine own workspace/image for self-rebuild."
+
+        helper = [
+            "docker", "run", "--rm", "-d",
+            "--user", "0:0",
+            "-v", f"{host_ws}:/workspace",
+            "-v", "/var/run/docker.sock:/var/run/docker.sock",
+            "-w", "/workspace",
+            img,
+            "docker", "compose", "-p", project, "up", "--build", "-d", "backend",
+        ]
+        try:
+            subprocess.run(helper, capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            return f"Error: failed to launch rebuild helper: {e}"
+        return (
+            "Rebuild launched — my backend image is being rebuilt and the "
+            "container swapped. The connection will drop; refresh in ~1-2 min."
+        )
 
     async def destroy_clone(self, name: str) -> str:
         """Destroy a clone — stops containers, removes code and data permanently.

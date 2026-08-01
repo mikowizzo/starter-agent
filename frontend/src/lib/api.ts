@@ -128,7 +128,9 @@ export interface CloneInfo {
 }
 
 export async function fetchClones(): Promise<{
+  self_name: string;
   self_port: number;
+  parent: { name: string; frontend_port: number } | null;
   clones: CloneInfo[];
 } | null> {
   try {

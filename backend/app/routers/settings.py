@@ -80,10 +80,12 @@ def _own_frontend_port() -> int:
 
 
 @router.get("/clones")
-async def get_clones():
+async def get_clones(request: Request):
     """This instance's frontend port plus all registered clones — powers the
     bottombar instance switcher. Each container's /workspace/.clones/registry.json
     is its own registry (clones keep their own), so this works on any instance.
+    A parent.json written by the creating instance carries the parent's name and
+    frontend port, so this instance's switcher can link back to it.
     """
     clones: list = []
     reg = Path("/workspace/.clones/registry.json")
@@ -94,8 +96,21 @@ async def get_clones():
                 clones = data
         except Exception:
             pass
+
+    parent = None
+    pf = Path("/workspace/parent.json")
+    if pf.exists():
+        try:
+            data = json.loads(pf.read_text())
+            if data.get("name") and str(data.get("frontend_port", "")).isdigit():
+                parent = {"name": data["name"], "frontend_port": int(data["frontend_port"])}
+        except Exception:
+            pass
+
     return {
+        "self_name": request.app.state.team.name,
         "self_port": _own_frontend_port(),
+        "parent": parent,
         "clones": clones,
     }
 

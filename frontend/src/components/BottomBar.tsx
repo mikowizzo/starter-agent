@@ -19,7 +19,9 @@ export function BottomBar({
   const [restarting, setRestarting] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [switcher, setSwitcher] = useState<{
+    self_name: string;
     self_port: number;
+    parent: { name: string; frontend_port: number } | null;
     clones: CloneInfo[];
   } | null>(null);
 
@@ -69,10 +71,10 @@ export function BottomBar({
     window.location.port ||
     (window.location.protocol === "https:" ? "443" : "80");
   // The instance we're viewing = the clone whose frontend port matches the
-  // URL we're on; if no clone matches, it's the self/parent pill.
+  // URL we're on; if no clone matches, it's the self pill.
   const currentName =
     switcher?.clones.find((c) => c.ports.frontend === Number(currentPort))
-      ?.name ?? "parent";
+      ?.name ?? switcher?.self_name ?? "";
 
   return (
     <div className="relative pb-[calc(0.5rem+env(safe-area-inset-bottom,0px))]">
@@ -132,14 +134,9 @@ export function BottomBar({
         </button>
       </div>
 
-      {/* Instance switcher — parent + running clones */}
+      {/* Instance switcher — running clones only */}
       {switcher && (
         <div className="flex items-center gap-1.5 overflow-x-auto px-1 pb-1 scrollbar-thin">
-          <InstanceLink
-            name="parent"
-            port={switcher.self_port}
-            isCurrent={currentName === "parent"}
-          />
           {switcher.clones
             .filter((c) => c.status === "running")
             .map((c) => (
