@@ -40,5 +40,9 @@ else
     echo "[entrypoint] requirements.txt unchanged, skipping pip sync"
 fi
 
+# Ensure .clones directory is writable by appuser (for clone_tools registry).
+mkdir -p /workspace/.clones
+chown 1000:1000 /workspace/.clones 2>/dev/null || true
+
 # Drop to non-root user for the application process.
 exec runuser -u appuser -- "$@"
