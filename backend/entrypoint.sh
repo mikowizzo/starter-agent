@@ -1,6 +1,29 @@
 #!/bin/sh
 set -e
 
+# Self-heal Docker socket access. The socket is owned by the host's docker
+# group, whose GID varies per machine. We start as root, so add appuser to
+# whatever group owns the socket — no DOCKER_GID env var needed, works for
+# stale containers on the next restart too.
+if [ -e /var/run/docker.sock ]; then
+    DOCKER_GID=$(stat -c %g /var/run/docker.sock)
+    DOCKER_GRP=$(getent group "$DOCKER_GID" | cut -d: -f1)
+    if [ -z "$DOCKER_GRP" ]; then
+        if groupadd -g "$DOCKER_GID" docker 2>/dev/null; then
+            DOCKER_GRP=docker
+        fi
+    fi
+    if [ -n "$DOCKER_GRP" ]; then
+        usermod -aG "$DOCKER_GRP" appuser || \
+            echo "[entrypoint] warning: could not add appuser to group '$DOCKER_GRP'"
+        echo "[entrypoint] docker socket access via group '$DOCKER_GRP' (gid $DOCKER_GID)"
+    else
+        echo "[entrypoint] warning: could not resolve docker socket group (gid $DOCKER_GID)"
+    fi
+else
+    echo "[entrypoint] no docker socket mounted — clone tools will report daemon unreachable"
+fi
+
 # Only sync packages when requirements.txt has actually changed.
 # Compares a hash of requirements.txt against the last successful sync.
 NEW_HASH=$(sha256sum requirements.txt | cut -d' ' -f1)

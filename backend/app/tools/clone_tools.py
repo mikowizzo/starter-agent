@@ -191,9 +191,11 @@ class CloneTools(Toolkit):
         err = (r.stderr or r.stdout or "").lower()
         if "permission denied" in err:
             return False, (
-                "Permission denied on the Docker socket. The container's docker "
-                "group GID does not match the host's. Rebuild the image with "
-                "--build-arg DOCKER_GID=$(getent group docker | cut -d: -3)."
+                "Permission denied on the Docker socket. The container was "
+                "started without the host's docker group. Recreate it from the "
+                "host: docker compose up -d --build --force-recreate "
+                "(newer images self-heal socket access in the entrypoint, so "
+                "a plain restart suffices once rebuilt)."
             )
         if "cannot connect" in err or "no such file" in err:
             return False, (

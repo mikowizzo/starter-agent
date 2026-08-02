@@ -23,19 +23,20 @@ Open `.env` and paste your OpenCode API key:
 OPENCODE_API_KEY=your-key-here
 ```
 
-**3. Build with your host's Docker GID**
+**3. Start it**
 
-The agent can clone itself via Docker, so the container needs access to the
-host's Docker socket. The socket is owned by a `docker` group whose GID varies
-by host. Build with your host's GID so the in-container user can reach it:
+The backend self-heals Docker socket access on startup — it detects the host's
+docker group and adds the app user to it, so self-cloning works on any machine
+without configuration:
 
 ```bash
-export DOCKER_GID=$(getent group docker | cut -d: -f3)
 docker compose up --build
 ```
 
-(If you don't care about self-cloning, you can skip the `DOCKER_GID` export —
-the default works on most Debian/Ubuntu hosts.)
+(If you're on an older image without the self-heal, export the host's docker
+GID instead: `export DOCKER_GID=$(getent group docker | cut -d: -f3)`. And if
+you hit "permission denied on the Docker socket", just
+`docker compose up -d --build --force-recreate` — the entrypoint fixes it.)
 
 **4. Open it**
 
