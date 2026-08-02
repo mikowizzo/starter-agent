@@ -1,1 +1,1 @@
-from . import sessions, settings
+from . import sessions as sessions, settings as settings

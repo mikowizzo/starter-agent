@@ -12,7 +12,6 @@ Without the lock it fails almost every rerun; with it, all land.
 """
 
 import threading
-import tempfile
 from pathlib import Path
 
 from app.tools.code_tools import CodeTools

@@ -1,11 +1,14 @@
-"""Minimal file toolkit — read, write, edit, grep, glob, delete, move."""
+"""Minimal file toolkit — read, write, edit, grep, glob, delete, move, shell."""
 
 import ast
 import difflib
 import fcntl
 import functools
 import os
+import re
+import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -21,6 +24,16 @@ _EXCLUDE_GLOBS = [f"!**/{d}/**" for d in _EXCLUDE_DIRS] + [
 
 _EDIT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "starter-code-edit.lock")
 _EDIT_THREAD_LOCK = threading.Lock()
+
+# ── shell tool guardrails ─────────────────────────────────────────────
+_SHELL_TIMEOUT = 30
+_SHELL_MAX_OUTPUT = 8000
+# Commands that reach past the workspace (privilege escalation, secret
+# dumps, host-level destruction). Never whitelist these.
+_SHELL_BLOCKED_CMDS = {
+    "sudo", "su", "env", "printenv", "shutdown", "reboot", "poweroff",
+    "mkfs", "dd", "fdisk", "iptables", "killall",
+}
 
 
 @contextmanager
@@ -69,7 +82,7 @@ class CodeTools(Toolkit):
             name="code_tools",
             tools=[
                 self.read, self.write, self.edit,
-                self.grep, self.glob, self.delete, self.move,
+                self.grep, self.glob, self.delete, self.move, self.shell,
             ],
         )
 
@@ -401,3 +414,75 @@ class CodeTools(Toolkit):
         dst_p.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src_p), str(dst_p))
         return f"✅ Moved: {source} → {destination}"
+
+    # ── shell (guarded) ────────────────────────────────────────────────
+
+    def _shell_guard(self, command: str) -> str | None:
+        """Return an error string if the command escapes the workspace, else None.
+
+        ponytail: regex guardrail, not a sandbox — command substitution
+        ($(cat /etc/passwd)) can dodge it. Real containment = run in a
+        container/bwrap. Add that only if this leaks.
+        """
+        if self._env_access(command):
+            return "❌ Shell: .env access is blocked."
+        for raw in re.findall(r"\S+", command):
+            tok = raw.strip("\"'")
+            if tok in _SHELL_BLOCKED_CMDS or tok.startswith("mkfs"):
+                return f"❌ Shell: '{tok}' is blocked."
+            if tok.startswith(("~", "$HOME", "${HOME}")) or tok.startswith(".."):
+                return f"❌ Shell: path escapes workspace: {tok}"
+            if tok.startswith("/") and not Path(tok).resolve().is_relative_to(self.base):
+                return f"❌ Shell: path outside workspace: {tok}"
+        return None
+
+    @staticmethod
+    def _env_access(command: str) -> bool:
+        """True if the command references a .env* file path (bare or quoted).
+
+        shlex.split strips quotes, so `cat ".env"` -> token `.env`. A token
+        is a path if it is `.env`, `.env.<ext>` (incl. globs like `.env*`),
+        or `.../.env[...]`. Prose like `.env is blocked` never matches, so
+        commit messages and docs aren't false positives.
+        """
+        try:
+            tokens = shlex.split(command)
+        except ValueError:  # unbalanced quotes — fall back to raw tokens
+            tokens = re.findall(r"\S+", command)
+        return any(
+            re.search(r"(?:^|/)\.env(?:\.[A-Za-z0-9_]+)?\*?$", tok)
+            for tok in tokens
+        )
+
+    def shell(self, command: str) -> str:
+        """Run a shell command, cwd = workspace root.
+
+        Guardrails (best-effort, not a sandbox):
+          - .env access blocked (also env/printenv)
+          - paths outside the workspace blocked (.., ~, $HOME, absolutes)
+          - destructive/system commands blocked (sudo, su, dd, mkfs, ...)
+
+        Args:
+            command: Shell command to run.
+        """
+        if not command.strip():
+            return "❌ Shell: empty command"
+        err = self._shell_guard(command)
+        if err:
+            return err
+        proc = subprocess.Popen(
+            command, shell=True, cwd=str(self.base),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        try:
+            out, err = proc.communicate(timeout=_SHELL_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            out, err = proc.communicate()
+            return f"❌ Shell: timed out after {_SHELL_TIMEOUT}s — killed: {err.strip()[:300]}"
+        text = out + (("\n[stderr]\n" + err) if err.strip() else "")
+        if len(text) > _SHELL_MAX_OUTPUT:
+            text = text[:_SHELL_MAX_OUTPUT] + f"\n…[truncated {len(text) - _SHELL_MAX_OUTPUT} chars]"
+        tag = f"exit {proc.returncode}" if proc.returncode else "ok"
+        return f"$ {command}\n[{tag}] {text.strip() or '(no output)'}"

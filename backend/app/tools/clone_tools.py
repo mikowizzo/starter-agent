@@ -60,7 +60,6 @@ class CloneTools(Toolkit):
                 self.stop_clone,
                 self.start_clone,
                 self.rebuild_clone,
-                self.rebuild_self,
                 self.destroy_clone,
                 self.gc_orphans,
             ],
@@ -572,43 +571,6 @@ class CloneTools(Toolkit):
         self._save_registry(registry)
         return f"Clone '{name}' rebuilt and restarted."
 
-    async def rebuild_self(self) -> str:
-        """Rebuild this agent's own backend image and swap the container.
-
-        New baked-in deps (requirements.txt) need a fresh image AND a container
-        replacement — but replacing our own container kills any process inside
-        it, including the compose CLI. So the rebuild runs in a detached helper
-        container (our own image, docker socket + workspace mounted, root) that
-        survives the swap and finishes the job. This process is replaced
-        mid-flight; reply to the user before the swap lands.
-        """
-        project = os.environ.get("CLONE_NAME", "repo")
-        host_ws = self._host_workspace_dir()
-        img = subprocess.run(
-            ["docker", "inspect", os.environ.get("HOSTNAME", ""),
-             "--format", "{{.Config.Image}}"],
-            capture_output=True, text=True, timeout=10,
-        ).stdout.strip()
-        if not host_ws or not img:
-            return "Error: can't determine own workspace/image for self-rebuild."
-
-        helper = [
-            "docker", "run", "--rm", "-d",
-            "--user", "0:0",
-            "-v", f"{host_ws}:/workspace",
-            "-v", "/var/run/docker.sock:/var/run/docker.sock",
-            "-w", "/workspace",
-            img,
-            "docker", "compose", "-p", project, "up", "--build", "-d", "backend",
-        ]
-        try:
-            subprocess.run(helper, capture_output=True, text=True, timeout=30)
-        except Exception as e:
-            return f"Error: failed to launch rebuild helper: {e}"
-        return (
-            "Rebuild launched — my backend image is being rebuilt and the "
-            "container swapped. The connection will drop; refresh in ~1-2 min."
-        )
 
     async def destroy_clone(self, name: str) -> str:
         """Destroy a clone — stops containers, removes code and data permanently.
@@ -693,10 +655,6 @@ class CloneTools(Toolkit):
         """
         registry = self._load_registry()
         registry_names = {c["name"] for c in registry}
-        registry_names_with_pending = {
-            c["name"] for c in registry
-            if c.get("status") == "pending"
-        }
         removed: list[str] = []
 
         # --- 1. Retry zombie clones ---
