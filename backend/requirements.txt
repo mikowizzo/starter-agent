@@ -3,7 +3,6 @@ agno[os]>=2.6.0,<2.7.0
 agno[openai]>=2.6.0,<2.7.0
 ag-ui-protocol
 requests>=2.31.0
-ddgs
 
 # dev / quality
 pytest>=8.0,<9.0

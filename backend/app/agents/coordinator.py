@@ -11,7 +11,6 @@ from agno.db.sqlite import SqliteDb
 from agno.skills import LocalSkills, Skills
 from agno.skills.errors import SkillValidationError
 from agno.team import Team
-from agno.tools.duckduckgo import DuckDuckGoTools
 
 from app.models import primary_model
 from app.tools.code_tools import CodeTools
@@ -88,7 +87,6 @@ def build_team(
         tools=[
             code_tools,
             CloneTools(team_name=team_name),
-            DuckDuckGoTools(),
         ],
         skills=skills,
         markdown=True,
