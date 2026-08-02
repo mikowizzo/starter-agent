@@ -1,8 +1,0 @@
-Add guarded shell tool, remove rebuild_self, fix ruff warnings
-
-- CodeTools.shell: workspace-contained command runner with guardrails
-  (blocks .env* file access, parent/root paths, destructive/system commands)
-- shell guardrail blocks real .env path tokens but allows prose mentions
-  (commit messages/docs) - covered by test_shell_guardrails.py
-- clone_tools: drop rebuild_self tool (unreliable) and dead variable
-- routers/__init__: explicit re-export; drop unused tempfile import
