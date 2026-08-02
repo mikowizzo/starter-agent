@@ -54,6 +54,11 @@ export async function loadSessionHistory(sessionId: string): Promise<Message[]> 
     if (session.chat_history && Array.isArray(session.chat_history)) {
       for (const msg of session.chat_history) {
         if (msg.role === "user" || msg.role === "assistant") {
+          // History includes assistant messages that only contain tool calls
+          // (content === null). Skip them so they don't crash the renderer or
+          // render as blank bubbles — the following assistant message carries
+          // the actual answer.
+          if (msg.content == null) continue;
           messages.push({
             id: Date.now() + messages.length,
             role: msg.role,

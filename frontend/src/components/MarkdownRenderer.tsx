@@ -11,10 +11,10 @@ const components: Components = {
   ),
 };
 
-function MarkdownRendererImpl({ children }: { children: string }) {
+function MarkdownRendererImpl({ children }: { children?: string | null }) {
   return (
     <Markdown remarkPlugins={[remarkGfm]} components={components}>
-      {children}
+      {children ?? ""}
     </Markdown>
   );
 }

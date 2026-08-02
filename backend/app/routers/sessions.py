@@ -77,18 +77,26 @@ async def get_session(session_id: str):
 
     session_data = json.loads(row["session_data"] or "{}")
     runs = json.loads(row["runs"] or "[]")
+    # agno stores `runs` double-encoded (JSON string inside a JSON column).
+    # Decode the inner value so we iterate the actual run list.
+    if isinstance(runs, str):
+        runs = json.loads(runs)
 
     chat_history: list[dict] = []
     for run in runs:
-        msgs = (
-            run.get("run_response", {}).get("messages")
-            or run.get("response", {}).get("messages")
-            or []
-        )
+        # Current agno format: messages live at the TOP level of each run.
+        msgs = run.get("messages") or []
+        # Legacy format fallback: messages nested under run_response/response.
+        if not msgs:
+            rr = run.get("run_response") or run.get("response") or {}
+            msgs = rr.get("messages") or []
         for msg in msgs:
             role = msg.get("role")
             content = msg.get("content")
-            if role in ("user", "assistant") and content is not None:
+            # Skip tool-call-only assistant messages (content is None) and
+            # non-string content blocks — the following assistant message
+            # carries the actual answer.
+            if role in ("user", "assistant") and isinstance(content, str):
                 chat_history.append({"role": role, "content": content})
 
     return {
