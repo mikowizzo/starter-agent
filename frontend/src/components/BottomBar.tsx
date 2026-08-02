@@ -153,6 +153,15 @@ export function BottomBar({
   );
 }
 
+const CLONE_COLORS: Record<string, string> = {
+  nami: "text-orange-400",
+  zoro: "text-green-400",
+  sanji: "text-blue-400",
+  luffy: "text-red-400",
+  robin: "text-purple-400",
+  usopp: "text-yellow-400",
+};
+
 function InstanceLink({
   name,
   port,
@@ -166,7 +175,8 @@ function InstanceLink({
     "rounded-md px-2 py-0.5 text-[10px] font-medium whitespace-nowrap transition " +
     (isCurrent
       ? "bg-[var(--color-accent)] text-[var(--color-bg)] cursor-default"
-      : "text-[var(--color-accent)] hover:bg-[var(--color-border)]/40 active:scale-[0.95]");
+      : (CLONE_COLORS[name] ?? "text-[var(--color-accent)]") +
+        " hover:bg-[var(--color-border)]/40 active:scale-[0.95]");
   const href = `${window.location.protocol}//${window.location.hostname}:${port}`;
   return isCurrent ? (
     <span className={cls} title={`${name} — current instance`}>

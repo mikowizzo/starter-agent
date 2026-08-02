@@ -46,7 +46,35 @@ _PROTECTED_PROJECTS = {
     "eva",                                        # other host stacks
     "ibgateway", "ib_gateway",
 }
+def _add_backend_net_alias(compose: str, name: str) -> str:
+    """Give the clone's backend a unique network alias (``backend-<name>``).
 
+    All clone stacks share the ``starter-app-net`` network, and every one
+    declares a service named ``backend``. Docker DNS therefore resolves the
+    bare name ``backend`` to *every* clone's backend — a frontend proxying to
+    ``http://backend:8000`` round-robins between all of them, so conversations
+    bounce between crew members (the "identity crisis"). The alias makes
+    ``backend-<name>`` resolve only to this clone's own backend, and the
+    clone-creation code points the frontend proxy at it.
+
+    The service keeps its ``backend`` name (so compose reuses the existing
+    image — renaming would trigger a fresh build); only the network alias is
+    added, which compose applies on recreate without rebuilding.
+    """
+    if f'"backend-{name}"' in compose or f"backend-{name}:" in compose:
+        return compose  # already patched — idempotent
+    return re.sub(
+        r"(^\s*)networks:\n\s*-\s*starter-app-net\n",
+        lambda m: (
+            f"{m.group(1)}networks:\n"
+            f"{m.group(1)}  starter-app-net:\n"
+            f"{m.group(1)}    aliases:\n"
+            f'{m.group(1)}      - "backend-{name}"\n'
+        ),
+        compose,
+        count=1,
+        flags=re.MULTILINE,
+    )
 
 class CloneTools(Toolkit):
     """Create, list, stop, start, rebuild, destroy, and garbage-collect clones."""
@@ -468,7 +496,23 @@ class CloneTools(Toolkit):
                 flags=re.MULTILINE,
             )
 
+        # Every clone joins the shared starter-app-net, where the bare
+        # service name "backend" is aliased on every backend container. A
+        # frontend proxying to http://backend:8000 would round-robin across
+        # ALL clones (crew members answering each other's calls!). Give this
+        # clone a unique alias and point its frontend at it, so a clone only
+        # ever talks to itself.
+        compose = _add_backend_net_alias(compose, name)
         compose_path.write_text(compose)
+
+        # Point the clone's frontend proxy at its own unique backend alias.
+        vite_config = clone_dir / "frontend" / "vite.config.ts"
+        if vite_config.exists():
+            vite_text = vite_config.read_text()
+            vite_text = vite_text.replace(
+                "http://backend:8000", f"http://backend-{name}:8000"
+            )
+            vite_config.write_text(vite_text)
 
         # Tell the clone who its parent is, so its instance switcher can link
         # back to us. Read by /settings/clones on the clone's side.
