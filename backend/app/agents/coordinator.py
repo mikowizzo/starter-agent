@@ -15,6 +15,7 @@ from agno.team import Team
 from app.models import primary_model
 from app.tools.code_tools import CodeTools
 from app.tools.clone_tools import CloneTools
+from app.tools.team_comms import TeamComms
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ def build_team(
         tools=[
             code_tools,
             CloneTools(team_name=team_name),
+            TeamComms(),
         ],
         skills=skills,
         markdown=True,
