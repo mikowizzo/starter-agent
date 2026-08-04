@@ -20,11 +20,17 @@ by side.
 > `talk_to` tool instead.
 ## Usage
 
-    python backend/app/skills/ask-crew/ask_crew.py "What's the best way to..."
-    python backend/app/skills/ask-crew/ask_crew.py --models kimi-k3,glm-5.2 "..."
-    python backend/app/skills/ask-crew/ask_crew.py --file path/to/code.py "review this"
-    python backend/app/skills/ask-crew/ask_crew.py --file a.py --file b.py "compare these"
-    python backend/app/skills/ask-crew/ask_crew.py --file README.md   # defaults to "please review"
+Preferred — invoke through the skill access tools (never shell):
+
+    get_skill_script(skill_name="ask-crew", script_path="ask_crew.py", execute=True, args=["your question"])
+
+Legacy shell usage (kept for reference, not recommended):
+
+    python backend/app/skills/ask-crew/scripts/ask_crew.py "What's the best way to..."
+    python backend/app/skills/ask-crew/scripts/ask_crew.py --models kimi-k3,glm-5.2 "..."
+    python backend/app/skills/ask-crew/scripts/ask_crew.py --file path/to/code.py "review this"
+    python backend/app/skills/ask-crew/scripts/ask_crew.py --file a.py --file b.py "compare these"
+    python backend/app/skills/ask-crew/scripts/ask_crew.py --file README.md   # defaults to "please review"
 
 ## Files
 
@@ -49,4 +55,4 @@ by side.
   Don't "simplify" that away.
 - One model failing (e.g. transient router error) doesn't stop the others;
   its error prints inline.
-- To change the crew, edit `CREW` at the top of `ask_crew.py`.
+- To change the crew, edit `CREW` at the top of `scripts/ask_crew.py`.

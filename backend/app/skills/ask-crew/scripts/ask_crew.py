@@ -33,7 +33,7 @@ CREW = [
     ("glm-5.2", "GLM 5.2"),
 ]
 
-TIMEOUT = 120
+TIMEOUT = 300
 # Per-file inlining cap. Large files blow the context window; truncate with a
 # marker so the model still sees the structure.
 MAX_FILE_BYTES = 100_000

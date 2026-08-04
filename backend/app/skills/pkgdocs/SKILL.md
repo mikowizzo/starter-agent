@@ -15,9 +15,15 @@ installed packages, so this script reaches their files via the shell.
 
 ## Usage
 
-    python backend/app/skills/pkgdocs/pkgsearch.py session_name agno
-    python backend/app/skills/pkgdocs/pkgsearch.py --names "session" agno
-    python backend/app/skills/pkgdocs/pkgsearch.py --glob "*.md" "quickstart" agno
+Preferred — invoke through the skill access tools (never shell):
+
+    get_skill_script(skill_name="pkgdocs", script_path="pkgsearch.py", execute=True, args=["session_name", "agno"])
+
+Legacy shell usage (kept for reference, not recommended):
+
+    python backend/app/skills/pkgdocs/scripts/pkgsearch.py session_name agno
+    python backend/app/skills/pkgdocs/scripts/pkgsearch.py --names "session" agno
+    python backend/app/skills/pkgdocs/scripts/pkgsearch.py --glob "*.md" "quickstart" agno
 
 Flags: `--glob PAT` (default `*.py`), `--names` (match filenames), `-i` (ignore case).
 Omit PACKAGE to search all of site-packages.
