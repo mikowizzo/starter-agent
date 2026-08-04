@@ -1,17 +1,23 @@
 ---
 name: ask-crew
 description: >
-  Fire one query at multiple OpenCode models in parallel (MiniMax M3, Kimi K3,
+  Fire one query at multiple OpenCode MODELS in parallel (MiniMax M3, Kimi K3,
   Grok 4.5, GLM 5.2) and print each answer. Use to compare how different
-  models answer the same question. Reads OPENCODE_API_KEY from the environment.
+  MODELS answer the same question. IMPORTANT: this queries AI MODELS via the
+  OpenCode API — NOT the clone crew members (franky, nami, etc.). Do NOT use
+  the talk_to tool for this. Reads OPENCODE_API_KEY from the environment.
 license: MIT
 ---
 
 # Ask Crew
 
-Asks the "model crew" — four OpenCode models answer the same query in
-parallel and their answers are printed side by side.
+Asks the "model crew" — four OpenCode MODELS (MiniMax M3, Kimi K3, Grok 4.5,
+GLM 5.2) answer the same query in parallel and their answers are printed side
+by side.
 
+> ⚠️ This is about MODELS, not crew-member clones. "Ask the crew" =
+> this script. To message a Straw Hat clone (franky, nami, ...) use the
+> `talk_to` tool instead.
 ## Usage
 
     python backend/app/skills/ask-crew/ask_crew.py "What's the best way to..."
