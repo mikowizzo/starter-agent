@@ -3,17 +3,15 @@ name: scout
 description: "Scout — multi-engine web search and URL scraping. Use for 'scout X', 'look up X', 'research X', or any web search + content extraction."
 ---
 
-# Scout — Research Engine (Miko Only)
+# Scout — Research Engine
 
 Two scripts: `scout.py` (multi-engine search across Brave, Tavily, Exa) and `scrape.py` (single-URL content extraction). For stock fundamentals, use the `market-data` skill. For prediction market data, use the `polymarket` skill.
-
-**Owner: Miko.**
 
 ---
 
 ## Research Loop
 
-1. **Search** — Fire `scout.py search` with the topic. Search only; no scraping yet.
+1. **Search** — Fire `scout.py` with the topic. Search only; no scraping yet.
    *Done when:* results JSON returned.
 2. **Rank** — Scan ALL results before scraping any. Sort by information density (long-form, transcripts, research reports over short news), diversity of viewpoint, and authority (engine overlap = signal).
    *Done when:* ordered candidate list exists.
@@ -39,7 +37,7 @@ Fires Brave, Tavily, and Exa in parallel. Merges and deduplicates by normalised 
 **Usage:**
 ```
 get_skill_script('scout', 'scout.py', execute=True, args=[
-    'search', 'QUERY',
+    'QUERY',
     '--engine', 'all',
     '--count', '20',
     '--time-range', 'month'
@@ -50,8 +48,7 @@ get_skill_script('scout', 'scout.py', execute=True, args=[
 
 | Arg | Required | Default | Description |
 |-----|----------|---------|-------------|
-| `search` | Yes | — | Subcommand |
-| `query` | Yes | — | Search query / topic |
+| `query` | Yes | — | Search query / topic — single positional; pass the whole query as one arg element (no quotes needed) |
 | `--engine` | No | `all` | `all`, `brave`, `tavily`, `exa` |
 | `--count` | No | `20` | Per-engine result cap |
 | `--time-range` | No | None | `day`, `week`, `month`, `year` — passed to engines that support it |
@@ -73,9 +70,9 @@ get_skill_script('scout', 'scrape.py', execute=True, args=[
 
 **Arguments:** Single positional URL. No flags.
 
-**Output:** JSON to stdout — `url`, `title`, `content`, `method` (`trafilatura`/`jina`/`youtube`), `error`, `saved_to`. Always exits 0; check `content` and `error` for success.
+**Output:** JSON to stdout — `url`, `title`, `content`, `method` (`trafilatura`/`jina`/`youtube`), `error`, `saved_to`. Exits 0 on success, 1 on failure (so downstream scripts can detect errors); check `content` and `error`.
 
-**Auto-save:** Every successful scrape saves to `/tmp/miko-scrape/<slug>.txt` (override with `SCRAPE_SAVE_DIR`). Pass `saved_to` path to council via `--files`:
+**Auto-save:** Every successful scrape saves to `/tmp/scout-scrape/<slug>.txt` (override with `SCRAPE_SAVE_DIR`). Pass `saved_to` path to council via `--files`:
 ```
 result = get_skill_script('scout', 'scrape.py', execute=True, args=['https://example.com'])
 get_skill_script('council', 'council_run.py', execute=True, args=['PROMPT', '--files', result['saved_to']])

@@ -19,7 +19,7 @@ USER_AGENT = "Scope-Scrape/1.0"
 MAX_SCRAPE_CHARS = 30_000
 
 # Auto-save scraped content to this dir so other tools (council) can attach as --files
-SCRAPE_SAVE_DIR = Path(os.environ.get("SCRAPE_SAVE_DIR", "/tmp/miko-scrape"))
+SCRAPE_SAVE_DIR = Path(os.environ.get("SCRAPE_SAVE_DIR", "/tmp/scout-scrape"))
 
 logger = logging.getLogger("scrape")
 

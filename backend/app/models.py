@@ -1,4 +1,5 @@
-"""Model configuration — all models route through OpenCode.
+"""Model configuration. Models route through OpenCode by default, with
+per-model overrides for other providers (e.g. Synthetic API).
 
 Students get a single OPENCODE_API_KEY and can switch between models
 via the UI model selector. To add a new model, add an entry to MODELS.
@@ -33,8 +34,10 @@ class TextOnlyOpenAILike(OpenAILike):
 
 
 # ── Available models ────────────────────────────────────────────────
-# All route through OpenCode with a single OPENCODE_API_KEY.
-# supports_images: when False, multimodal content is stripped before sending.
+# Default route: OpenCode with a single OPENCODE_API_KEY.
+# Per-model overrides: set "base_url" and/or "api_key_env" to route a model
+# elsewhere (e.g. Synthetic API). supports_images: when False, multimodal
+# content is stripped before sending.
 
 MODELS = {
     "deepseek_v4_flash": {
@@ -58,6 +61,15 @@ MODELS = {
         "max_tokens": 65536,
         "supports_images": True,
     },
+    "kimi_k3_synthetic": {
+        "id": "hf:moonshotai/Kimi-K3",
+        "name": "Kimi K3 (Synthetic)",
+        "provider": "Synthetic",
+        "max_tokens": 65536,
+        "supports_images": False,
+        "base_url": "https://api.synthetic.new/v1",
+        "api_key_env": "SYNTHETIC_API_KEY",
+    },
 }
 
 BASE_URL = "https://opencode.ai/zen/go/v1"
@@ -70,8 +82,8 @@ def make_model(model_key: str) -> OpenAILike:
     cls = TextOnlyOpenAILike if not info.get("supports_images", False) else OpenAILike
     return cls(
         id=info["id"],
-        api_key=os.environ.get(API_KEY_ENV),
-        base_url=BASE_URL,
+        api_key=os.environ.get(info.get("api_key_env", API_KEY_ENV)),
+        base_url=info.get("base_url", BASE_URL),
         max_tokens=info["max_tokens"],
     )
 

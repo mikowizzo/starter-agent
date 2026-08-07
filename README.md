@@ -17,10 +17,11 @@ cd starter-agent
 cp .env.example .env
 ```
 
-Open `.env` and paste your OpenCode API key:
+Open `.env` and paste your OpenCode API key (required). Optionally add a Synthetic API key for extra models:
 
 ```
 OPENCODE_API_KEY=your-key-here
+SYNTHETIC_API_KEY=your-synthetic-key  # optional
 ```
 
 **3. Start it**

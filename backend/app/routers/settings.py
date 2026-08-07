@@ -43,6 +43,15 @@ async def set_model(request: Request):
             {"error": f"Unknown model '{model_key}'. Available: {list(MODELS.keys())}"},
             status_code=400,
         )
+    # Check if the model requires an API key that isn't set
+    info = MODELS[model_key]
+    api_key_env = info.get("api_key_env", "OPENCODE_API_KEY")
+    if not os.environ.get(api_key_env):
+        return JSONResponse(
+            {"error": f"Missing API key: {api_key_env}. Add it to your .env file and restart."},
+            status_code=500,
+        )
+    
     new_model = make_model(model_key)
     request.app.state.team.model = new_model
     return {"current": model_key, **MODELS[model_key]}
