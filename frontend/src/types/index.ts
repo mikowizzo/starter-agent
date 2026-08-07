@@ -47,6 +47,11 @@ export interface MessageMetrics {
   output_tokens?: number;
 }
 
+export interface Attachment {
+  name: string;
+  size: number;
+}
+
 export interface Message {
   id: number;
   role: "user" | "assistant" | "error";
@@ -56,6 +61,8 @@ export interface Message {
   timeline?: TimelineEntry[];
   /** Token usage metrics from the completed run */
   metrics?: MessageMetrics;
+  /** File attachments shown on user messages */
+  attachments?: Attachment[];
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

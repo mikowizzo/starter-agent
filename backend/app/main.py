@@ -9,7 +9,7 @@ from agno.os import AgentOS
 
 from app.config import BASE_DIR, DB_FILE, validate_env
 from app.agents.coordinator import build_team
-from app.routers import sessions, settings
+from app.routers import sessions, settings, convert
 
 validate_env()
 
@@ -27,3 +27,4 @@ app.state.team = team
 # Include custom routers (sessions override Agno's defaults via first-match)
 app.include_router(sessions.router)
 app.include_router(settings.router)
+app.include_router(convert.router)

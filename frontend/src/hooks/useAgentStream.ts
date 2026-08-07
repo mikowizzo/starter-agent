@@ -193,16 +193,39 @@ export function useAgentStream() {
   // ── Send message ─────────────────────────────────────────
 
   const send = useCallback(
-    async (text: string) => {
-      if (!text.trim() || loading) return;
+    async (text: string, files?: File[]) => {
+      if ((!text.trim() && !files?.length) || loading) return;
 
       const msg = text.trim();
+
+    // Convert files to markdown before sending
+    let fullMessage = msg;
+    const attachmentMeta = files?.map((f) => ({ name: f.name, size: f.size }));
+
+    if (files?.length) {
+      try {
+        const convertForm = new FormData();
+        files.forEach((f) => convertForm.append("files", f));
+        const convertRes = await fetch("/convert", {
+          method: "POST",
+          body: convertForm,
+        });
+        if (convertRes.ok) {
+          const data = await convertRes.json();
+          fullMessage = `${msg}\n${data.text}`.trim();
+        }
+      } catch {
+        // If conversion fails, send the text alone
+      }
+    }
       currentUserMsg.current = msg;
 
       const userMsg: Message = {
         id: Date.now(),
         role: "user",
         content: msg,
+      
+        attachments: attachmentMeta,
       };
       setMessages((prev) => [...prev, userMsg].slice(-MAX_MESSAGES));
 
@@ -227,7 +250,7 @@ export function useAgentStream() {
 
       try {
         const form = new FormData();
-        form.append("message", msg);
+        form.append("message", fullMessage);
         form.append("user_id", userId || "anonymous");
         if (sessionIdRef.current)
           form.append("session_id", sessionIdRef.current);

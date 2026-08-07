@@ -2,6 +2,7 @@ import { useRef, useState, useEffect, memo, type ReactNode } from "react";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import {
   ChevronRight,
+  FileText,
   Wrench,
   Loader2,
   Brain,
@@ -378,7 +379,22 @@ export const MessageBubble = memo(
           {hasTimeline ? (
             <TimelineView timeline={msg.timeline!} />
           ) : msg.role === "user" ? (
-            msg.content
+            <div className="flex flex-col items-end gap-2">
+              {msg.content && <span>{msg.content}</span>}
+              {msg.attachments && msg.attachments.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 justify-end">
+                  {msg.attachments.map((a, i) => (
+                    <span
+                      key={i}
+                      className="flex items-center gap-1 rounded-md bg-black/20 px-2 py-0.5 text-xs text-white/80"
+                    >
+                      <FileText className="h-3 w-3" />
+                      {a.name}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
           ) : (
             <div className="prose prose-invert">
               <MarkdownRenderer>{msg.content}</MarkdownRenderer>
