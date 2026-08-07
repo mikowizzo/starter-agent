@@ -215,7 +215,9 @@ export function useAgentStream() {
           fullMessage = `${msg}\n${data.text}`.trim();
         }
       } catch {
-        // If conversion fails, send the text alone
+        // Conversion endpoint failed — still tell the agent files were attached
+        const names = files.map((f) => f.name).join(", ");
+        fullMessage = `${msg}\n\n--- **Attached files (conversion unavailable): ${names}** ---\n`.trim();
       }
     }
       currentUserMsg.current = msg;
