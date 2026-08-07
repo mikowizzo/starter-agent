@@ -47,5 +47,4 @@ services:
 
 networks:
   starter-app-net:
-    name: starter-app-net
     driver: bridge
