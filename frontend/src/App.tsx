@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useLayoutEffect, useCallback } from "react
 import { Loader2 } from "lucide-react";
 import { InputBar } from "./components/InputBar";
 import { BottomBar } from "./components/BottomBar";
+import { FileExplorer } from "./components/FileExplorer";
 import {
   MessageBubble,
   ThinkingDots,
@@ -75,7 +76,7 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
     sessionId,
     setSessionId,
   } = stream;
-
+  const [filesOpen, setFilesOpen] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -234,10 +235,14 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
               onNewChat={clearChat}
               currentSessionId={sessionId}
               onSelectSession={loadSession}
+              onOpenFiles={() => setFilesOpen(true)}
             />
           </div>
-        </div>
       </div>
+      </div>
+
+      {/* Full-screen file editor */}
+      <FileExplorer open={filesOpen} onClose={() => setFilesOpen(false)} />
     </div>
   );
 }

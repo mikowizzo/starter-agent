@@ -26,9 +26,11 @@ export default defineConfig({
       "/agents": sseProxy,
       "/teams": sseProxy,
       "/settings": { target: "http://backend:8000" },
+      "/providers": { target: "http://backend:8000" },
       "/upload": { target: "http://backend:8000" },
       "/convert": { target: "http://backend:8000" },
       "/attachments": { target: "http://backend:8000" },
+      "/api/files": { target: "http://backend:8000" },
     },
   },
 });

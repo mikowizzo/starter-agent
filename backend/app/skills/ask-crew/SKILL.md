@@ -28,7 +28,7 @@ Preferred — invoke through the skill access tools (never shell):
 Legacy shell usage (kept for reference, not recommended):
 
     python backend/app/skills/ask-crew/scripts/ask_crew.py "What's the best way to..."
-    python backend/app/skills/ask-crew/scripts/ask_crew.py --models minimax-m3,glm-5.2 "..."
+    python backend/app/skills/ask-crew/scripts/ask_crew.py --models minimax-m3,GLM-5.2 "..."
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file path/to/code.py "review this"
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file a.py --file b.py "compare these"
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file README.md   # defaults to "please review"
@@ -44,7 +44,7 @@ can never silently route to the wrong API.
 | MiniMax M3 | `minimax-m3` | OpenCode (`OPENCODE_API_KEY`) |
 | Kimi K3 | `hf:moonshotai/Kimi-K3` | Synthetic (`SYNTHETIC_API_KEY`) |
 | Qwen 3.8 Max | `qwen3.8-max` | OpenCode (`OPENCODE_API_KEY`) |
-| GLM 5.2 | `glm-5.2` | OpenCode (`OPENCODE_API_KEY`) |
+| GLM 5.2 | `GLM-5.2` | ZAI (`ZAI_API_KEY`) |
 
 Default (no `--models`): all four.
 

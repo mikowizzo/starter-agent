@@ -10,7 +10,7 @@ from agno.os import AgentOS
 from app.config import BASE_DIR, DB_FILE, validate_env
 from app.db import init_attachment_tables
 from app.agents.coordinator import build_team
-from app.routers import sessions, settings, convert, attachments
+from app.routers import sessions, settings, convert, attachments, providers, files
 
 validate_env()
 
@@ -34,3 +34,6 @@ app.include_router(sessions.router)
 app.include_router(settings.router)
 app.include_router(convert.router)
 app.include_router(attachments.router)
+app.include_router(providers.router)
+app.include_router(files.router)
+files.register_exception_handlers(app)

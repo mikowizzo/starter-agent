@@ -48,11 +48,13 @@ MODELS = {
         "supports_images": False,
     },
     "glm_52": {
-        "id": "glm-5.2",
+        "id": "GLM-5.2",
         "name": "GLM 5.2",
-        "provider": "OpenCode",
+        "provider": "ZAI",
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+        "api_key_env": "ZAI_API_KEY",
         "max_tokens": 65536,
-        "supports_images": True,
+        "supports_images": False,
     },
     "minimax_m3": {
         "id": "minimax-m3",
@@ -60,6 +62,15 @@ MODELS = {
         "provider": "OpenCode",
         "max_tokens": 65536,
         "supports_images": True,
+    },
+    "deepseek_v4_flash_or": {
+        "id": "deepseek/deepseek-v4-flash-0731",
+        "name": "DeepSeek V4 Flash (OpenRouter)",
+        "provider": "OpenRouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "max_tokens": 65536,
+        "supports_images": False,
     },
     "kimi_k3_synthetic": {
         "id": "hf:moonshotai/Kimi-K3",
@@ -89,5 +100,5 @@ def make_model(model_key: str) -> OpenAILike:
 
 
 def primary_model() -> OpenAILike:
-    """Default model — DeepSeek V4 Flash (fast, great for learning)."""
-    return make_model("deepseek_v4_flash")
+    """Default model — GLM 5.2."""
+    return make_model("glm_52")

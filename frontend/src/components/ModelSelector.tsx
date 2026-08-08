@@ -1,11 +1,27 @@
 import { useState, useEffect } from "react";
 import { Loader2, Check } from "lucide-react";
-import { fetchModel, setModel, fetchModels, type ModelInfo, type ModelOption } from "../lib/api";
+import { fetchModel, setModel, fetchModels, fetchQuota, fetchSyntheticQuota, type ModelInfo, type ModelOption, type QuotaInfo } from "../lib/api";
+
+
+function formatQuota(quota: QuotaInfo): string | null {
+  const { percentage: pct, reset_at: resetAt } = quota;
+  if (pct == null) return null;
+  const pctStr = `${Math.round(pct)}%`;
+  if (!resetAt) return pctStr;
+  const diff = resetAt - Date.now();
+  if (diff <= 0) return pctStr;
+  const hours = Math.floor(diff / 3600000);
+  const mins = Math.floor((diff % 3600000) / 60000);
+  if (hours > 0) return `${pctStr} ${hours}h${mins}m`;
+  return `${pctStr} ${mins}m`;
+}
 
 export function ModelSelector({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [current, setCurrent] = useState<ModelInfo | null>(null);
   const [models, setModels] = useState<Record<string, ModelOption>>({});
   const [switching, setSwitching] = useState<string | null>(null);
+  const [quota, setQuota] = useState<QuotaInfo | null>(null);
+  const [synthQuota, setSynthQuota] = useState<QuotaInfo | null>(null);
 
   // Refetch every time the popover opens — caches are pre-warmed so
   // this is instant after first load.
@@ -19,9 +35,12 @@ export function ModelSelector({ open, onClose }: { open: boolean; onClose: () =>
         fetchModel(),
         fetchModels(),
       ]);
+      const [q, sq] = await Promise.all([fetchQuota(), fetchSyntheticQuota()]);
       if (cancelled) return;
       setCurrent(model);
       setModels(list);
+      if (q) setQuota(q);
+      if (sq) setSynthQuota(sq);
     })();
     return () => { cancelled = true; };
   }, [open]);
@@ -64,6 +83,12 @@ export function ModelSelector({ open, onClose }: { open: boolean; onClose: () =>
                 >
                   <span className="truncate font-medium">{opt.name}</span>
                   <span className="text-[10px] opacity-40">{opt.provider}</span>
+                  {opt.provider.toLowerCase().includes("zai") && quota && formatQuota(quota) && (
+                    <span className="text-[10px] text-[var(--color-accent)]">({formatQuota(quota)})</span>
+                  )}
+                  {opt.provider.toLowerCase().includes("synthetic") && synthQuota && formatQuota(synthQuota) && (
+                    <span className="text-[10px] text-[var(--color-accent)]">({formatQuota(synthQuota)})</span>
+                  )}
                   <div className="flex-1" />
                   {isSwitching ? (
                     <Loader2 className="h-3 w-3 animate-spin shrink-0" />

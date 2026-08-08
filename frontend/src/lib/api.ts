@@ -124,6 +124,34 @@ export async function setModel(model: string): Promise<ModelInfo | null> {
   }
 }
 
+// ── Quota ────────────────────────────────────────────────────────
+
+export interface QuotaInfo {
+  percentage: number | null;
+  reset_at: number | null;
+  error?: string;
+}
+
+export async function fetchQuota(): Promise<QuotaInfo | null> {
+  try {
+    const res = await fetch("/providers/zai/quota");
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchSyntheticQuota(): Promise<QuotaInfo | null> {
+  try {
+    const res = await fetch("/providers/synthetic/quota");
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
 // ── Instance switcher (parent + clones) ──────────────────────────
 
 export interface CloneInfo {

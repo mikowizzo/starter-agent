@@ -15,7 +15,7 @@ Allowed --models ids (exact match; anything else is rejected with this list):
   minimax-m3               MiniMax M3       (OpenCode)
   hf:moonshotai/Kimi-K3    Kimi K3          (Synthetic)
   qwen3.8-max              Qwen 3.8 Max     (OpenCode)
-  glm-5.2                  GLM 5.2          (OpenCode)
+  GLM-5.2                  GLM 5.2          (ZAI)
   (default: all of the above)
 
 Pass one or more --file PATH args to inline file contents into the prompt.
@@ -43,7 +43,8 @@ CREW = [
     ("hf:moonshotai/Kimi-K3", "Kimi K3 (Synthetic)",
      "https://api.synthetic.new/v1", "SYNTHETIC_API_KEY"),
     ("qwen3.8-max", "Qwen 3.8 Max"),
-    ("glm-5.2", "GLM 5.2"),
+    ("GLM-5.2", "GLM 5.2 (ZAI)",
+     "https://api.z.ai/api/coding/paas/v4", "ZAI_API_KEY"),
 ]
 
 

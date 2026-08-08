@@ -1,19 +1,41 @@
 import { useState, useEffect } from "react";
-import { History, RotateCw } from "lucide-react";
+import { History, RotateCw, Folder } from "lucide-react";
 import { HistoryModal } from "./HistoryModal";
 import { ModelSelector } from "./ModelSelector";
-import { fetchModel, fetchClones, type CloneInfo } from "../lib/api";
+import { fetchModel, fetchClones, fetchQuota, fetchSyntheticQuota, type CloneInfo, type QuotaInfo } from "../lib/api";
+
+
+// ── Quota formatting ─────────────────────────────────────────────
+
+function formatQuota(quota: QuotaInfo): string | null {
+  const { percentage: pct, reset_at: resetAt } = quota;
+  if (pct == null) return null;
+
+  let suffix = "";
+  if (resetAt) {
+    const diff = Math.max(0, resetAt - Date.now());
+    const h = Math.floor(diff / 3_600_000);
+    const m = Math.floor((diff % 3_600_000) / 60_000);
+    suffix = ` ${h}h${String(m).padStart(2, "0")}m`;
+  }
+  return `${pct}%${suffix}`;
+}
 
 export function BottomBar({
   onNewChat,
   currentSessionId,
   onSelectSession,
+  onOpenFiles,
 }: {
   onNewChat: () => void;
   currentSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
+  onOpenFiles: () => void;
 }) {
   const [modelName, setModelName] = useState("");
+  const [modelProvider, setModelProvider] = useState("");
+  const [quota, setQuota] = useState<QuotaInfo | null>(null);
+  const [synthQuota, setSynthQuota] = useState<QuotaInfo | null>(null);
   const [showModelSelector, setShowModelSelector] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [restarting, setRestarting] = useState(false);
@@ -28,11 +50,14 @@ export function BottomBar({
   async function refreshModel() {
     const info = await fetchModel();
     if (info?.name) setModelName(info.name);
+    if (info?.provider) setModelProvider(info.provider);
   }
 
   useEffect(() => {
     refreshModel();
     fetchClones().then(setSwitcher);
+    fetchQuota().then((q) => { if (q) setQuota(q); });
+    fetchSyntheticQuota().then((q) => { if (q) setSynthQuota(q); });
   }, []);
 
   async function handleRestart() {
@@ -65,6 +90,13 @@ export function BottomBar({
         setRestarting(false);
       }
     }, 1000);
+  }
+
+  // Quota badge — only for ZAI models
+  const provider = modelProvider.toLowerCase();
+  let quotaExtra: string | null = null;
+  if (provider.includes("zai") && quota) {
+    quotaExtra = formatQuota(quota);
   }
 
   const currentPort =
@@ -101,9 +133,12 @@ export function BottomBar({
         <button
           onClick={() => setShowModelSelector(!showModelSelector)}
           title="Switch model"
-          className="rounded-lg px-1.5 py-1 text-[10px] font-medium text-[var(--color-dim)] transition hover:text-[var(--color-accent)] active:scale-[0.95]"
+          className="flex items-center gap-1.5 rounded-lg px-1.5 py-1 text-[10px] font-medium text-[var(--color-dim)] transition hover:text-[var(--color-accent)] active:scale-[0.95]"
         >
           {modelName || "..."}
+          {quotaExtra && (
+            <span className="text-[var(--color-accent)]">({quotaExtra})</span>
+          )}
         </button>
 
         {/* Restart button */}
@@ -123,6 +158,15 @@ export function BottomBar({
         </button>
 
         <div className="flex-1" />
+
+        {/* Files */}
+        <button
+          onClick={onOpenFiles}
+          title="Files"
+          className="flex items-center justify-center rounded-lg p-1.5 text-[var(--color-dim)] transition hover:text-[var(--color-accent)] active:scale-[0.95]"
+        >
+          <Folder className="h-4 w-4" />
+        </button>
 
         {/* History */}
         <button
