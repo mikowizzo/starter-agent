@@ -31,7 +31,9 @@ OLD_HASH=$(cat /tmp/.req-hash 2>/dev/null || echo "")
 
 if [ "$NEW_HASH" != "$OLD_HASH" ]; then
     echo "[entrypoint] requirements.txt changed, syncing packages..."
-    if timeout 30 uv pip install --system -r requirements.txt; then
+    # 300s: markitdown[all] is a large dependency tree; 30s timed out on
+    # fresh containers and booted with missing packages (silent breakage).
+    if timeout 300 uv pip install --system -r requirements.txt; then
         echo "$NEW_HASH" > /tmp/.req-hash
     else
         echo "[entrypoint] pip sync failed (offline?), booting with existing packages"
