@@ -33,6 +33,21 @@ Legacy shell usage (kept for reference, not recommended):
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file a.py --file b.py "compare these"
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file README.md   # defaults to "please review"
 
+## Models
+
+The `--models` flag takes **exact ids only** — there are no aliases. An
+unknown id is rejected with the list below (exit code 2), so a misspelling
+can never silently route to the wrong API.
+
+| Model | `--models` id | Route |
+|---|---|---|
+| MiniMax M3 | `minimax-m3` | OpenCode (`OPENCODE_API_KEY`) |
+| Kimi K3 | `hf:moonshotai/Kimi-K3` | Synthetic (`SYNTHETIC_API_KEY`) |
+| Qwen 3.8 Max | `qwen3.8-max` | OpenCode (`OPENCODE_API_KEY`) |
+| GLM 5.2 | `glm-5.2` | OpenCode (`OPENCODE_API_KEY`) |
+
+Default (no `--models`): all four.
+
 ## Files
 
 - `--file PATH` may be passed multiple times. Each file's contents are

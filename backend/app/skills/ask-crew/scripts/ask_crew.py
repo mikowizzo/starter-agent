@@ -6,10 +6,17 @@ Most models route through OpenCode; Kimi K3 routes through the Synthetic API
 
 Usage:
   python ask_crew.py "your question here"
-  python ask_crew.py --models minimax-m3,glm-5.2 "your question"
+  python ask_crew.py --models minimax-m3,hf:moonshotai/Kimi-K3 "your question"
   python ask_crew.py --file path/to/code.py "review this"
   python ask_crew.py --file a.py --file b.py "compare these"
   python ask_crew.py --file README.md         # default: "please review"
+
+Allowed --models ids (exact match; anything else is rejected with this list):
+  minimax-m3               MiniMax M3       (OpenCode)
+  hf:moonshotai/Kimi-K3    Kimi K3          (Synthetic)
+  qwen3.8-max              Qwen 3.8 Max     (OpenCode)
+  glm-5.2                  GLM 5.2          (OpenCode)
+  (default: all of the above)
 
 Pass one or more --file PATH args to inline file contents into the prompt.
 Text files are inlined; binary files are noted but not inlined. Files larger
@@ -38,6 +45,8 @@ CREW = [
     ("qwen3.8-max", "Qwen 3.8 Max"),
     ("glm-5.2", "GLM 5.2"),
 ]
+
+
 
 def route(entry: tuple) -> tuple[str, str]:
     """(full endpoint url, api_key_env) for a crew entry; default = OpenCode."""
@@ -197,10 +206,17 @@ def main() -> int:
     if not query and not files:
         print(__doc__)
         return 2
-    by_id = {e[0]: e for e in CREW}
     jobs = []  # (entry, base_url, key)
     for mid in models:
-        entry = by_id.get(mid, (mid, mid))  # unknown ids default to OpenCode route
+        entry = next((e for e in CREW if e[0] == mid), None)
+        if entry is None:
+            print(
+                f"ERROR: unknown model {mid!r}. Allowed --models ids "
+                f"(exact match, no aliases):\n"
+                + "\n".join(f"  {e[0]}" for e in CREW),
+                file=sys.stderr,
+            )
+            return 2
         base_url, key_env = route(entry)
         key = get_env_key(key_env)
         if not key:
