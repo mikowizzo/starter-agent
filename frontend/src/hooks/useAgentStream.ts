@@ -240,6 +240,35 @@ export function useAgentStream() {
 
       const msg = text.trim();
 
+      // ── Instant UI feedback ────────────────────────────────────────
+      // The attachment pipeline (upload → poll → assemble) can take many
+      // seconds for large files. Push the user bubble + assistant
+      // placeholder into the timeline FIRST so the thinking dots appear
+      // the moment Send is clicked, instead of the UI looking frozen.
+      currentUserMsg.current = msg;
+
+      const userMsg: Message = {
+        id: Date.now(),
+        role: "user",
+        content: msg,
+        attachments: files?.map((f) => ({ name: f.name, size: f.size })),
+      };
+      setMessages((prev) => [...prev, userMsg].slice(-MAX_MESSAGES));
+
+      setLoading(true);
+      const ac = new AbortController();
+      abortRef.current = ac;
+      activeRunIdRef.current = null;
+
+      const assistantId = Date.now() + 1;
+      const assistantMsg: Message = {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        timeline: [],
+      };
+      setMessages((prev) => [...prev, assistantMsg].slice(-MAX_MESSAGES));
+
       // ── Attachments: upload -> poll -> server-side assemble ─────────
       // The backend stores the raw file, extracts text in the background,
       // and builds a token-budgeted <attachments> block (inline / excerpt /
@@ -248,7 +277,6 @@ export function useAgentStream() {
       // the snapshot is persisted server-side for deterministic replay.
       let fullMessage = msg;
       let attachmentIds: string[] = [];
-      const attachmentMeta = files?.map((f) => ({ name: f.name, size: f.size }));
 
       if (files?.length) {
         // Make sure we have a session id before uploading (attachments are
@@ -287,29 +315,11 @@ export function useAgentStream() {
         }
       }
 
-      currentUserMsg.current = msg;
-
-      const userMsg: Message = {
-        id: Date.now(),
-        role: "user",
-        content: msg,
-        attachments: attachmentMeta,
-      };
-      setMessages((prev) => [...prev, userMsg].slice(-MAX_MESSAGES));
-
-      setLoading(true);
-      const ac = new AbortController();
-      abortRef.current = ac;
-      activeRunIdRef.current = null;
-
-      const assistantId = Date.now() + 1;
-      const assistantMsg: Message = {
-        id: assistantId,
-        role: "assistant",
-        content: "",
-        timeline: [],
-      };
-      setMessages((prev) => [...prev, assistantMsg].slice(-MAX_MESSAGES));
+      // User hit Stop while files were uploading — don't start a run.
+      if (ac.signal.aborted) {
+        if (abortRef.current === ac) abortRef.current = null;
+        return;
+      }
 
       const state = newStreamState();
 
@@ -362,7 +372,7 @@ export function useAgentStream() {
         }
       } finally {
         setLoading(false);
-        abortRef.current = null;
+        if (abortRef.current === ac) abortRef.current = null;
       }
     },
     [
