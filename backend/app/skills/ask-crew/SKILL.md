@@ -1,19 +1,20 @@
 ---
 name: ask-crew
 description: >
-  Fire one query at multiple OpenCode MODELS in parallel (MiniMax M3, Kimi K3,
-  Qwen 3.8 Max, GLM 5.2) and print each answer. Use to compare how different
-  MODELS answer the same question. IMPORTANT: this queries AI MODELS via the
-  OpenCode API — NOT the clone crew members (franky, nami, etc.). Do NOT use
-  the talk_to tool for this. Reads OPENCODE_API_KEY from the environment.
+  Fire one query at multiple MODELS in parallel (MiniMax M3, Kimi K3 via
+  Synthetic, Qwen 3.8 Max, GLM 5.2) and print each answer. Use to compare how
+  different MODELS answer the same question. IMPORTANT: this queries AI MODELS
+  via the OpenCode/Synthetic APIs — NOT the clone crew members (franky, nami,
+  etc.). Do NOT use the talk_to tool for this. Reads OPENCODE_API_KEY from the
+  environment (SYNTHETIC_API_KEY for Kimi K3).
 license: MIT
 ---
 
 # Ask Crew
-
-Asks the "model crew" — four OpenCode MODELS (MiniMax M3, Kimi K3, Qwen 3.8 Max,
-GLM 5.2) answer the same query in parallel and their answers are printed side
-by side.
+Asks the "model crew" — four MODELS (MiniMax M3, Kimi K3 via Synthetic,
+Qwen 3.8 Max, GLM 5.2) answer the same query in parallel and their answers
+are printed side by side. All route through OpenCode except Kimi K3, which
+uses the Synthetic API (SYNTHETIC_API_KEY).
 
 > ⚠️ This is about MODELS, not crew-member clones. "Ask the crew" =
 > this script. To message a Straw Hat clone (franky, nami, ...) use the
@@ -27,7 +28,7 @@ Preferred — invoke through the skill access tools (never shell):
 Legacy shell usage (kept for reference, not recommended):
 
     python backend/app/skills/ask-crew/scripts/ask_crew.py "What's the best way to..."
-    python backend/app/skills/ask-crew/scripts/ask_crew.py --models kimi-k3,glm-5.2 "..."
+    python backend/app/skills/ask-crew/scripts/ask_crew.py --models minimax-m3,glm-5.2 "..."
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file path/to/code.py "review this"
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file a.py --file b.py "compare these"
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file README.md   # defaults to "please review"

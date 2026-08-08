@@ -389,7 +389,7 @@ export const MessageBubble = memo(
                       className="flex items-center gap-1 rounded-md bg-black/20 px-2 py-0.5 text-xs text-white/80"
                     >
                       <FileText className="h-3 w-3" />
-                      {a.name}
+                      {a.filename || a.name}
                     </span>
                   ))}
                 </div>

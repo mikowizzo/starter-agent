@@ -47,9 +47,21 @@ export interface MessageMetrics {
   output_tokens?: number;
 }
 
+export type AttachmentStatus = "pending" | "processing" | "ready" | "failed";
+
 export interface Attachment {
-  name: string;
-  size: number;
+  id: string;
+  session_id: string;
+  filename: string;
+  mime_type: string | null;
+  size_bytes: number;
+  status: AttachmentStatus;
+  token_count: number | null;
+  error: string | null;
+  created_at: string;
+  /** Legacy display alias (kept for older message meta) */
+  name?: string;
+  size?: number;
 }
 
 export interface Message {

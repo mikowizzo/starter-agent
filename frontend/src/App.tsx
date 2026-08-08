@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useLayoutEffect } from "react";
+import { useState, useRef, useEffect, useLayoutEffect, useCallback } from "react";
 import { Loader2 } from "lucide-react";
 import { InputBar } from "./components/InputBar";
 import { BottomBar } from "./components/BottomBar";
@@ -78,10 +78,17 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
 
   const [loadingHistory, setLoadingHistory] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
+  // Suppresses onScroll while we are scrolling programmatically, so our own
+  // scrolls can never flip isNearBottomRef to false (that used to kill
+  // auto-follow mid-run — see the smooth-scroll race below).
+  const autoScrollLockRef = useRef(false);
   const loadIdRef = useRef(0);
 
   const hasActiveRun = loading || !!activeRun;
+  const hasActiveRunRef = useRef(hasActiveRun);
+  hasActiveRunRef.current = hasActiveRun;
 
   // ── Init ──────────────────────────────────────────────────────────
 
@@ -98,14 +105,43 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
     })();
   }, [setMessages]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // useLayoutEffect: jump before paint, no flash.
+  // Pin to the bottom. Instant while streaming: smooth scrollTo animations get
+  // cancelled and restarted on every SSE delta, so the scrollbar lags behind
+  // and never catches up — and once that lag exceeds the 100px threshold, the
+  // onScroll handler permanently disables auto-follow for the run.
+  const scrollToBottom = useCallback((smooth: boolean) => {
+    const el = scrollRef.current;
+    if (!el) return;
+    autoScrollLockRef.current = true;
+    el.scrollTo({
+      top: el.scrollHeight,
+      behavior: smooth ? "smooth" : "auto",
+    });
+    requestAnimationFrame(() => {
+      autoScrollLockRef.current = false;
+    });
+  }, []);
+
+  // 1) State-driven growth: every SSE delta, tool patch, and card update flows
+  //    through `messages`/`hasActiveRun`, so pin synchronously before paint.
   useLayoutEffect(() => {
     if (!isNearBottomRef.current) return;
-    scrollRef.current?.scrollTo({
-      top: scrollRef.current.scrollHeight,
-      behavior: "smooth",
+    scrollToBottom(!hasActiveRun);
+  }, [messages, hasActiveRun, scrollToBottom]);
+
+  // 2) Non-state growth: async avatar/markdown images, webfonts, and card
+  //    expansion change the message list's height without a React state change.
+  //    Watch the list wrapper and re-pin whenever it grows.
+  useLayoutEffect(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (!isNearBottomRef.current) return;
+      scrollToBottom(!hasActiveRunRef.current);
     });
-  }, [messages, hasActiveRun]);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [scrollToBottom]);
 
   // ── Actions ───────────────────────────────────────────────────────
 
@@ -154,32 +190,36 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
             ref={scrollRef}
             onScroll={() => {
               const el = scrollRef.current;
-              if (!el) return;
+              // Ignore our own programmatic scrolls — only a real user scroll
+              // (or its final resting state) may flip the near-bottom flag.
+              if (!el || autoScrollLockRef.current) return;
               isNearBottomRef.current =
                 el.scrollHeight - el.scrollTop - el.clientHeight < 100;
             }}
-            className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden overscroll-contain space-y-6 pr-1 pb-2 scrollbar-thin"
+            className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden overscroll-contain scrollbar-thin pr-1 pb-2"
           >
-            {loadingHistory && (
-              <div className="flex justify-center py-12">
-                <Loader2 className="h-5 w-5 animate-spin text-[var(--color-dim)]" />
-              </div>
-            )}
-
-            {!loadingHistory &&
-              messages.map((msg) =>
-                !isVisible(msg) ? null : (
-                  <MessageBubble
-                    key={msg.id}
-                    msg={msg}
-                    running={hasActiveRun}
-                    isLast={msg.id === lastMsg?.id}
-                    isLastUser={msg.id === lastUserMsg?.id}
-                  />
-                ),
+            <div ref={contentRef} className="space-y-6">
+              {loadingHistory && (
+                <div className="flex justify-center py-12">
+                  <Loader2 className="h-5 w-5 animate-spin text-[var(--color-dim)]" />
+                </div>
               )}
 
-            {showThinking && <ThinkingDots />}
+              {!loadingHistory &&
+                messages.map((msg) =>
+                  !isVisible(msg) ? null : (
+                    <MessageBubble
+                      key={msg.id}
+                      msg={msg}
+                      running={hasActiveRun}
+                      isLast={msg.id === lastMsg?.id}
+                      isLastUser={msg.id === lastUserMsg?.id}
+                    />
+                  ),
+                )}
+
+              {showThinking && <ThinkingDots />}
+            </div>
           </div>
 
           {/* Input */}

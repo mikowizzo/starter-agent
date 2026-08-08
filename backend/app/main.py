@@ -8,10 +8,15 @@ from agno.db.sqlite import SqliteDb
 from agno.os import AgentOS
 
 from app.config import BASE_DIR, DB_FILE, validate_env
+from app.db import init_attachment_tables
 from app.agents.coordinator import build_team
-from app.routers import sessions, settings, convert
+from app.routers import sessions, settings, convert, attachments
 
 validate_env()
+
+# Create app-owned tables (attachments, message_attachments) before serving.
+# Idempotent — safe to run at every startup.
+init_attachment_tables()
 
 db = SqliteDb(db_file=DB_FILE)
 team = build_team(base_dir=BASE_DIR, db=db)
@@ -28,3 +33,4 @@ app.state.team = team
 app.include_router(sessions.router)
 app.include_router(settings.router)
 app.include_router(convert.router)
+app.include_router(attachments.router)

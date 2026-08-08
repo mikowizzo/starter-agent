@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Ask the model crew — fire one query at multiple OpenCode models in parallel.
+"""Ask the model crew — fire one query at multiple models in parallel.
+
+Most models route through OpenCode; Kimi K3 routes through the Synthetic API
+(SYNTHETIC_API_KEY). See CREW below.
 
 Usage:
   python ask_crew.py "your question here"
-  python ask_crew.py --models kimi-k3,glm-5.2 "your question"
+  python ask_crew.py --models minimax-m3,glm-5.2 "your question"
   python ask_crew.py --file path/to/code.py "review this"
   python ask_crew.py --file a.py --file b.py "compare these"
   python ask_crew.py --file README.md         # default: "please review"
@@ -12,7 +15,7 @@ Pass one or more --file PATH args to inline file contents into the prompt.
 Text files are inlined; binary files are noted but not inlined. Files larger
 than MAX_FILE_BYTES are truncated with a warning.
 
-Reads OPENCODE_API_KEY from the environment (same key the app uses).
+Reads OPENCODE_API_KEY (and SYNTHETIC_API_KEY for Kimi K3) from the env.
 """
 import concurrent.futures
 import json
@@ -25,13 +28,25 @@ from pathlib import Path
 BASE_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 KEY_ENV = "OPENCODE_API_KEY"
 
-# The model crew: (OpenCode model id, display label).
+# The model crew: (model id, display label, [base_url, api_key_env]).
+# Two-tuples route via OpenCode (BASE_URL + OPENCODE_API_KEY); four-tuples
+# override the route — e.g. Kimi K3 goes through the Synthetic API instead.
 CREW = [
     ("minimax-m3", "MiniMax M3"),
-    ("kimi-k3", "Kimi K3"),
+    ("hf:moonshotai/Kimi-K3", "Kimi K3 (Synthetic)",
+     "https://api.synthetic.new/v1", "SYNTHETIC_API_KEY"),
     ("qwen3.8-max", "Qwen 3.8 Max"),
     ("glm-5.2", "GLM 5.2"),
 ]
+
+def route(entry: tuple) -> tuple[str, str]:
+    """(full endpoint url, api_key_env) for a crew entry; default = OpenCode."""
+    if len(entry) >= 4:
+        base, key_env = entry[2], entry[3]
+        # entry base_url is a bare base (e.g. .../v1) — append the completions path.
+        url = base if base.endswith("/chat/completions") else base.rstrip("/") + "/chat/completions"
+        return url, key_env
+    return BASE_URL, KEY_ENV
 
 TIMEOUT = 300
 # Per-file inlining cap. Large files blow the context window; truncate with a
@@ -46,6 +61,23 @@ HEADERS = {
 }
 
 
+def get_env_key(name: str) -> str:
+    """Read a key from the environment, falling back to /workspace/.env."""
+    key = os.environ.get(name, "")
+    if key:
+        return key
+    env_file = Path("/workspace/.env")
+    if env_file.is_file():
+        try:
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    return ""
+
+
 def read_file_block(path: str) -> str | None:
     """Read a file and return a prompt-ready block, or None if unusable.
 
@@ -57,7 +89,13 @@ def read_file_block(path: str) -> str | None:
     """
     p = Path(path)
     if not p.is_file():
-        return None
+        # Fall back to the workspace root — the script may run from a
+        # different cwd than the caller (e.g. invoked via skill tools).
+        alt = Path("/workspace") / path
+        if alt.is_file():
+            p = alt
+        else:
+            return None
     try:
         size = p.stat().st_size
         with p.open("rb") as f:
@@ -104,13 +142,13 @@ def build_prompt(query: str, files: list[str]) -> str:
     return query
 
 
-def ask(model_id: str, query: str, key: str) -> tuple[str, str, float]:
+def ask(model_id: str, query: str, base_url: str, key: str) -> tuple[str, str, float]:
     """Ask one model, return (model_id, content_or_error, elapsed_seconds)."""
     body = json.dumps(
         {"model": model_id, "messages": [{"role": "user", "content": query}]}
     ).encode()
     req = urllib.request.Request(
-        BASE_URL,
+        base_url,
         data=body,
         method="POST",
         headers={k: v.format(key=key) for k, v in HEADERS.items()},
@@ -129,7 +167,7 @@ def ask(model_id: str, query: str, key: str) -> tuple[str, str, float]:
 
 def parse_args(argv: list[str]) -> tuple[list[str], list[str], str]:
     """Parse CLI into (models, files, query). Query may be empty (file-only)."""
-    models: list[str] = [m for m, _ in CREW]
+    models: list[str] = [e[0] for e in CREW]
     files: list[str] = []
     rest: list[str] = []
     i = 0
@@ -159,25 +197,30 @@ def main() -> int:
     if not query and not files:
         print(__doc__)
         return 2
-
-    key = os.environ.get(KEY_ENV, "")
-    if not key:
-        print(f"ERROR: {KEY_ENV} not set", file=sys.stderr)
-        return 1
+    by_id = {e[0]: e for e in CREW}
+    jobs = []  # (entry, base_url, key)
+    for mid in models:
+        entry = by_id.get(mid, (mid, mid))  # unknown ids default to OpenCode route
+        base_url, key_env = route(entry)
+        key = get_env_key(key_env)
+        if not key:
+            print(f"ERROR: {key_env} not set (needed for {entry[1]})", file=sys.stderr)
+            return 1
+        jobs.append((entry, base_url, key))
 
     prompt = build_prompt(query, files)
     # Show a short summary, not the full inlined prompt (which may be huge).
     summary = query or "(no question — file review only)"
     if files:
         summary += f"  [files: {', '.join(files)}]"
-    print(f"🤖 Asking the crew ({len(models)} models): {summary}\n")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as pool:
-        futures = [pool.submit(ask, mid, prompt, key) for mid in models]
+    print(f"🤖 Asking the crew ({len(jobs)} models): {summary}\n")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = [pool.submit(ask, e[0], prompt, base_url, key) for e, base_url, key in jobs]
         results = [f.result() for f in futures]
 
-    order = {m: i for i, m in enumerate(models)}
+    order = {e[0][0]: i for i, e in enumerate(jobs)}
     for mid, content, dt in sorted(results, key=lambda r: order[r[0]]):
-        label = next((l for m, l in CREW if m == mid), mid)
+        label = next((e[1] for e in CREW if e[0] == mid), mid)
         print(f"── {label} ({mid}) — {dt:.1f}s ──")
         print(content)
         print()

@@ -11,7 +11,7 @@
  */
 
 import { useState, useRef, useCallback, useEffect } from "react";
-import type { Message } from "../types";
+import type { Attachment, Message } from "../types";
 import {
   agnoSessionId,
   userId,
@@ -28,6 +28,48 @@ import { readSSEStream } from "./sse";
 const RESUME_MAX_RETRIES = 2;
 const RESUME_DELAY_MS = 2000; // flat delay between retries
 
+/** UUID with a fallback for non-secure contexts (LAN IP, older browsers)
+ *  where crypto.randomUUID is unavailable and would throw. */
+function uuid(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+// ── Attachment upload / poll helpers ──────────────────────────────
+const POLL_INTERVAL_MS = 500;
+const POLL_TIMEOUT_MS = 30_000;
+
+async function uploadFiles(
+  files: File[],
+  sessionId: string,
+): Promise<Attachment[]> {
+  const form = new FormData();
+  files.forEach((f) => form.append("files", f));
+  form.append("session_id", sessionId);
+  const res = await fetch("/attachments", { method: "POST", body: form });
+  if (!res.ok) throw new Error(`upload failed: ${res.status}`);
+  const data = await res.json();
+  return (data?.attachments ?? []) as Attachment[];
+}
+
+async function waitForAttachment(a: Attachment): Promise<Attachment> {
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  let cur = a;
+  while (cur.status === "pending" || cur.status === "processing") {
+    if (Date.now() > deadline)
+      return { ...cur, status: "failed", error: "processing timed out" };
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    const res = await fetch(`/attachments/${cur.id}`);
+    if (!res.ok) break;
+    cur = (await res.json()) as Attachment;
+  }
+  return cur;
+}
 function failAssistant(
   id: number,
   content: string,
@@ -198,35 +240,59 @@ export function useAgentStream() {
 
       const msg = text.trim();
 
-    // Convert files to markdown before sending
-    let fullMessage = msg;
-    const attachmentMeta = files?.map((f) => ({ name: f.name, size: f.size }));
+      // ── Attachments: upload -> poll -> server-side assemble ─────────
+      // The backend stores the raw file, extracts text in the background,
+      // and builds a token-budgeted <attachments> block (inline / excerpt /
+      // reference / failed-with-path). The exact block is appended to the
+      // message so the model sees real content (or an explicit pointer) and
+      // the snapshot is persisted server-side for deterministic replay.
+      let fullMessage = msg;
+      let attachmentIds: string[] = [];
+      const attachmentMeta = files?.map((f) => ({ name: f.name, size: f.size }));
 
-    if (files?.length) {
-      try {
-        const convertForm = new FormData();
-        files.forEach((f) => convertForm.append("files", f));
-        const convertRes = await fetch("/convert", {
-          method: "POST",
-          body: convertForm,
-        });
-        if (convertRes.ok) {
-          const data = await convertRes.json();
-          fullMessage = `${msg}\n${data.text}`.trim();
+      if (files?.length) {
+        // Make sure we have a session id before uploading (attachments are
+        // session-scoped). Client-generated uuids are compatible with agno.
+        if (!sessionIdRef.current) {
+          const id = uuid();
+          sessionIdRef.current = id;
+          updateSessionId(id);
         }
-      } catch {
-        // Conversion endpoint failed — still tell the agent files were attached
-        const names = files.map((f) => f.name).join(", ");
-        fullMessage = `${msg}\n\n--- **Attached files (conversion unavailable): ${names}** ---\n`.trim();
+        const sid = sessionIdRef.current;
+
+        try {
+          const uploaded = await uploadFiles(files, sid);
+          const settled = await Promise.all(uploaded.map(waitForAttachment));
+          attachmentIds = settled.map((a) => a.id);
+
+          const messageId = uuid();
+          const assembleRes = await fetch("/attachments/assemble", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message_id: messageId,
+              attachment_ids: attachmentIds,
+              session_id: sid,
+            }),
+          });
+          if (assembleRes.ok) {
+            const data = await assembleRes.json();
+            if (data.text) fullMessage = `${msg}\n\n${data.text}`.trim();
+          }
+        } catch {
+          // Upload/assemble pipeline failed — fall back to a plain stub so
+          // the agent at least knows files were attached (legacy behavior).
+          const names = files.map((f) => f.name).join(", ");
+          fullMessage = `${msg}\n\n--- **Attached files (conversion unavailable): ${names}** ---\n`.trim();
+        }
       }
-    }
+
       currentUserMsg.current = msg;
 
       const userMsg: Message = {
         id: Date.now(),
         role: "user",
         content: msg,
-      
         attachments: attachmentMeta,
       };
       setMessages((prev) => [...prev, userMsg].slice(-MAX_MESSAGES));
@@ -256,6 +322,8 @@ export function useAgentStream() {
         form.append("user_id", userId || "anonymous");
         if (sessionIdRef.current)
           form.append("session_id", sessionIdRef.current);
+        if (attachmentIds.length)
+          form.append("attachment_ids", JSON.stringify(attachmentIds));
         form.append("stream", "true");
         // Run in background mode: the team keeps executing even if the
         // SSE connection drops (browser refresh), and can be resumed.
@@ -302,11 +370,11 @@ export function useAgentStream() {
       readStream,
       resumeWithRetry,
       updateAssistant,
+      updateSessionId,
       clearRun,
       setMessages,
     ],
   );
-
   // ── Reconnect (page load / tab reopen) ───────────────────
 
   const reconnect = useCallback(async () => {

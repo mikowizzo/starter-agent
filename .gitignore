@@ -19,6 +19,10 @@ frontend/dist/
 # Backups
 *.bak
 *.bak.*
--e 
+
+# Scratch + runtime data
+.scratch/
+uploads/
+
 # Clones
 .clones/
