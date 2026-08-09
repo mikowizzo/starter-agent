@@ -24,5 +24,8 @@ frontend/dist/
 .scratch/
 uploads/
 
+# Per-clone personality (never commit — each clone has its own)
+personality.local.md
+
 # Clones
 .clones/
