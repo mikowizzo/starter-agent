@@ -235,6 +235,11 @@ class WorkspaceFS:
         if parent_resolved != self.root and self.root not in parent_resolved.parents:
             raise PathOutsideWorkspace(f"path escapes workspace: {rel!r}")
 
+        # Re-check denied names on resolved parent path (catches symlink bypasses)
+        for part in parent_resolved.relative_to(self.root).parts:
+            if part in DENIED_NAMES:
+                raise DeniedPath(f"access to {part!r} is denied (via symlink)")
+
         result = parent_resolved / raw.name
 
         # If must_exist, verify via lstat (works for broken symlinks too)
@@ -388,10 +393,8 @@ class WorkspaceFS:
             if p.exists():
                 shutil.copymode(p, tmp)
             else:
-                # New file: use umask-appropriate mode (0o644 typical)
-                umask = os.umask(0o022)
-                os.umask(umask)  # restore immediately
-                os.chmod(tmp, 0o666 & ~umask)
+                # New file: apply standard mode (0o644 typical)
+                os.chmod(tmp, 0o644)
             os.replace(tmp, p)
         except BaseException:
             try:

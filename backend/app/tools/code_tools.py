@@ -152,7 +152,7 @@ class CodeTools(Toolkit):
         except UnicodeDecodeError:
             return f"❌ Binary file (not valid UTF-8): {path}"
         total = len(lines)
-        if total == 0:
+        if total == 0 or (total == 1 and lines[0] == ""):
             return f"⚠️ Empty file: {path}"
         if offset >= total:
             return (
@@ -438,7 +438,7 @@ class CodeTools(Toolkit):
             return dst_p
         if not src_p.exists():
             return f"❌ Source not found: {source}"
-        if dst_p.exists():
+        if os.path.lexists(dst_p):
             return f"❌ Destination already exists (will not overwrite): {destination}"
         if src_p == dst_p:
             return "❌ Source and destination are the same path."
