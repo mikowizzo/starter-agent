@@ -40,15 +40,15 @@ FileKind = Literal["file", "dir"]
 # ---------------------------------------------------------------------------
 
 #: Never touch these, anywhere, at any depth. Exact component matches only,
-#: so ".gitignore" and ".env.example" remain accessible on purpose.
-DENIED_NAMES: frozenset[str] = frozenset({".git", ".env"})
+#: Only .git is fully blocked. Everything else (including .env, .clones) is accessible.
+DENIED_NAMES: frozenset[str] = frozenset({".git"})
 
 #: Hidden from the tree (noise), but still reachable by direct path.
 TREE_EXCLUDE_NAMES: frozenset[str] = frozenset({
     "node_modules", "__pycache__", ".venv", "venv", "env",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
     "dist", "build", "target", ".next", ".nuxt", ".turbo",
-    ".DS_Store", ".clones",
+    ".DS_Store",
 })
 
 READ_MAX_BYTES = 1 * 1024 * 1024       # 1MB text reads
