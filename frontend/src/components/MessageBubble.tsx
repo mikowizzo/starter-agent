@@ -298,7 +298,15 @@ function ActionButtons({
     try {
       await navigator.clipboard.writeText(text);
     } catch {
-      /* ignore */
+      // Fallback for non-secure contexts (HTTP, not localhost)
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch { /* ignore */ }
+      document.body.removeChild(ta);
     }
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
