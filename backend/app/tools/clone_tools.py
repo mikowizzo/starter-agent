@@ -63,7 +63,11 @@ def _add_backend_net_alias(compose: str, name: str) -> str:
     """
     if f'"backend-{name}"' in compose or f"backend-{name}:" in compose:
         return compose  # already patched — idempotent
-    return re.sub(
+
+    # 1. Give the backend service a unique alias so the parent and other
+    #    clones can address it as backend-<name>. Convert the backend's
+    #    list-form networks entry into a map form that carries the alias.
+    compose = re.sub(
         r"(^\s*)networks:\n\s*-\s*starter-app-net\n",
         lambda m: (
             f"{m.group(1)}networks:\n"
@@ -75,6 +79,20 @@ def _add_backend_net_alias(compose: str, name: str) -> str:
         count=1,
         flags=re.MULTILINE,
     )
+
+    # 2. Mark the shared network EXTERNAL so compose reuses the REAL,
+    #    pre-existing starter-app-net instead of silently creating a
+    #    project-scoped copy (e.g. nami_starter-app-net). Without this the
+    #    alias from step 1 lands on the private copy, invisible to the
+    #    parent — the exact name-resolution bug we hit with team_comms.
+    compose = re.sub(
+        r"(?m)^(\s*)starter-app-net:\n\s*driver:\s*bridge\n",
+        rf"\1starter-app-net:\n\1  external: true\n",
+        compose,
+        count=1,
+    )
+    return compose
+
 
 class CloneTools(Toolkit):
     """Create, list, stop, start, rebuild, destroy, and garbage-collect clones."""
@@ -250,6 +268,18 @@ class CloneTools(Toolkit):
 
     @staticmethod
     async def _compose_up(clone_dir: Path, name: str, port_b: int, port_f: int) -> subprocess.CompletedProcess:
+        # Ensure the shared external network exists BEFORE compose up, since
+        # clone compose files reference it with external: true (compose will
+        # refuse to start if it's missing). Create is idempotent (`|| true`).
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["docker", "network", "create", "starter-app-net"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception:
+            pass  # Non-fatal — compose will still try, and it often already exists.
+
         return await asyncio.to_thread(
             subprocess.run,
             ["docker", "compose", "-p", name, "up", "--build", "-d"],

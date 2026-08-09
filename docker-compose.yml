@@ -47,4 +47,8 @@ services:
 
 networks:
   starter-app-net:
-    driver: bridge
+    # External: reuse the one pre-existing shared network instead of
+    # creating a project-scoped copy. Is created idempotently before any
+    # clone compose up (see clone_tools._compose_up). Must exist before
+    # `docker compose up` for this stack too.
+    external: true
