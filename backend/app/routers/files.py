@@ -207,11 +207,11 @@ class WorkspaceFS:
         Guarantees on success:
           * result == workspace root, or is strictly inside it
           * no component (at any depth) is in DENIED_NAMES
-          * symlink escapes are caught (resolve() follows symlinks, we check
-            containment on the RESOLVED path)
+          * symlink escapes are caught
 
-        We intentionally do not string-filter "..": resolve() collapses it and
-        the containment check does the real work.
+        We resolve the PARENT directory (following symlinks there) but never
+        follow the final component. This means delete/move operate on the link
+        itself, not the target — preventing data loss on symlink deletion.
         """
         if not rel or "\x00" in rel:
             raise InvalidPath("path is empty or contains a NUL byte")
@@ -219,21 +219,34 @@ class WorkspaceFS:
         if rel.startswith(("/", "\\")) or Path(rel).is_absolute():
             raise InvalidPath(f"absolute paths are not allowed: {rel!r}")
 
-        try:
-            resolved = (self.root / rel).resolve(strict=must_exist)
-        except FileNotFoundError:
-            raise NotFound(f"not found: {rel}")
-        except (OSError, RuntimeError) as e:
-            raise InvalidPath(f"unresolvable path {rel!r}: {e}")
-
-        if resolved != self.root and self.root not in resolved.parents:
-            raise PathOutsideWorkspace(f"path escapes workspace: {rel!r}")
-
-        for part in resolved.relative_to(self.root).parts:
+        # Check denied names on the raw path components (before resolution)
+        for part in Path(rel).parts:
             if part in DENIED_NAMES:
                 raise DeniedPath(f"access to {part!r} is denied")
 
-        return resolved
+        raw = self.root / rel
+        # Resolve the parent for containment check, keep the final component literal
+        try:
+            parent_resolved = raw.parent.resolve()
+        except (OSError, RuntimeError) as e:
+            raise InvalidPath(f"unresolvable parent for {rel!r}: {e}")
+
+        # Containment check: parent must be the root or a descendant of it
+        if parent_resolved != self.root and self.root not in parent_resolved.parents:
+            raise PathOutsideWorkspace(f"path escapes workspace: {rel!r}")
+
+        result = parent_resolved / raw.name
+
+        # If must_exist, verify via lstat (works for broken symlinks too)
+        if must_exist:
+            try:
+                os.lstat(result)
+            except FileNotFoundError:
+                raise NotFound(f"not found: {rel}")
+            except OSError as e:
+                raise InvalidPath(f"cannot stat {rel!r}: {e}")
+
+        return result
 
     def _rel(self, path: Path) -> str:
         return path.relative_to(self.root).as_posix()
@@ -249,7 +262,11 @@ class WorkspaceFS:
             return TreeResponse(root_name=self.root.name, entries=entries, truncated=True)
         return TreeResponse(root_name=self.root.name, entries=entries, truncated=False)
 
-    def _walk(self, dir_path: Path, rel_dir: str, out: list[TreeEntry]) -> None:
+    _TREE_MAX_DEPTH = 64
+
+    def _walk(self, dir_path: Path, rel_dir: str, out: list[TreeEntry], depth: int = 0) -> None:
+        if depth > self._TREE_MAX_DEPTH:
+            return
         if len(out) >= TREE_MAX_ENTRIES:
             raise _TreeTruncated
         try:
@@ -263,6 +280,9 @@ class WorkspaceFS:
         subdirs: list[tuple[Path, str]] = []
         for entry in children:
             if entry.name in self._tree_skip:
+                continue
+            # Hide temp files from atomic writes
+            if entry.name.startswith(".") and entry.name.endswith(".tmp"):
                 continue
             rel = f"{rel_dir}/{entry.name}" if rel_dir else entry.name
             try:
@@ -293,7 +313,7 @@ class WorkspaceFS:
                 raise _TreeTruncated
 
         for path, rel in subdirs:
-            self._walk(path, rel, out)
+            self._walk(path, rel, out, depth + 1)
 
     # -- read ------------------------------------------------------------------
 
@@ -367,6 +387,11 @@ class WorkspaceFS:
                 os.fsync(f.fileno())
             if p.exists():
                 shutil.copymode(p, tmp)
+            else:
+                # New file: use umask-appropriate mode (0o644 typical)
+                umask = os.umask(0o022)
+                os.umask(umask)  # restore immediately
+                os.chmod(tmp, 0o666 & ~umask)
             os.replace(tmp, p)
         except BaseException:
             try:
@@ -388,7 +413,7 @@ class WorkspaceFS:
             raise InvalidPath("cannot move the workspace root")
         if src in dst.parents:
             raise InvalidPath("cannot move a directory into itself")
-        if dst.exists() or dst.is_symlink():
+        if os.path.lexists(dst) or dst.is_symlink():
             raise AlreadyExists(f"destination exists: {dst_rel}")
         if not dst.parent.is_dir():
             raise NotFound(f"destination directory does not exist: {dst_rel}")

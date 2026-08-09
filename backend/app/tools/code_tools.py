@@ -78,6 +78,8 @@ class CodeTools(Toolkit):
         # every call path — agno's dispatcher or direct — goes through it.
         self.write = _serialized(self.write)
         self.edit = _serialized(self.edit)
+        self.delete = _serialized(self.delete)
+        self.move = _serialized(self.move)
         super().__init__(
             name="code_tools",
             tools=[
@@ -88,12 +90,18 @@ class CodeTools(Toolkit):
 
     # ── helpers ──────────────────────────────────────────────────────────
 
+    #: Names that must never be read/written/edited/deleted at any depth.
+    _DENIED_NAMES: frozenset[str] = frozenset({".git", ".env"})
+
     def _safe_resolve(self, path: str) -> Path | str:
         """Resolve path, returning an ❌ string instead of raising."""
         try:
             p = (self.base / path).resolve()
             if not p.is_relative_to(self.base):
                 raise ValueError(f"Path escapes base: {path}")
+            for part in p.relative_to(self.base).parts:
+                if part in self._DENIED_NAMES:
+                    raise ValueError(f"Access to {part!r} is blocked")
             return p
         except ValueError as e:
             return f"❌ {e}"
@@ -139,7 +147,10 @@ class CodeTools(Toolkit):
             return "❌ offset must be >= 0"
         if limit <= 0:
             return "❌ limit must be > 0"
-        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError:
+            return f"❌ Binary file (not valid UTF-8): {path}"
         total = len(lines)
         if total == 0:
             return f"⚠️ Empty file: {path}"
@@ -216,9 +227,14 @@ class CodeTools(Toolkit):
         if not line_mode and not search:
             return "❌ Nothing to edit: provide either search or old_start/old_end."
 
-        src_lines = p.read_text(encoding="utf-8", errors="replace").splitlines(
-            keepends=True
-        )
+        try:
+            raw = p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return f"❌ Not a UTF-8 text file, refusing to edit (would corrupt binary data): {path}"
+        # NUL byte check — likely binary
+        if "\x00" in raw[:8192]:
+            return f"❌ Binary file (NUL byte detected), refusing to edit: {path}"
+        src_lines = raw.splitlines(keepends=True)
 
         if line_mode:
             if old_start is None or old_end is None:
@@ -315,7 +331,7 @@ class CodeTools(Toolkit):
             args.extend(["-g", file_filter])
         for g in _EXCLUDE_GLOBS:
             args.extend(["-g", g])
-        args += [pattern, str(root.relative_to(self.base))]
+        args += ["-e", pattern, "--", str(root.relative_to(self.base))]
         out = self._rg(args)
         if out.startswith("❌"):
             return out
@@ -361,7 +377,7 @@ class CodeTools(Toolkit):
         args.extend(["-g", g])
         for eg in _EXCLUDE_GLOBS:
             args.extend(["-g", eg])
-        args.append(str(root.relative_to(self.base)))
+        args += ["--", str(root.relative_to(self.base))]
         out = self._rg(args)
         if out.startswith("❌"):
             return out
@@ -411,8 +427,15 @@ class CodeTools(Toolkit):
             return f"❌ Source not found: {source}"
         if dst_p.exists():
             return f"❌ Destination already exists (will not overwrite): {destination}"
+        if src_p == dst_p:
+            return "❌ Source and destination are the same path."
+        if src_p in dst_p.parents:
+            return "❌ Cannot move a directory into itself."
         dst_p.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src_p), str(dst_p))
+        try:
+            shutil.move(str(src_p), str(dst_p))
+        except (OSError, shutil.Error) as e:
+            return f"❌ Move failed: {e}"
         return f"✅ Moved: {source} → {destination}"
 
     # ── shell (guarded) ────────────────────────────────────────────────
@@ -430,10 +453,16 @@ class CodeTools(Toolkit):
             tok = raw.strip("\"'")
             if tok in _SHELL_BLOCKED_CMDS or tok.startswith("mkfs"):
                 return f"❌ Shell: '{tok}' is blocked."
-            if tok.startswith(("~", "$HOME", "${HOME}")) or tok.startswith(".."):
+            if tok.startswith(("~", "$HOME", "${HOME}")):
                 return f"❌ Shell: path escapes workspace: {tok}"
-            if tok.startswith("/") and not Path(tok).resolve().is_relative_to(self.base):
-                return f"❌ Shell: path outside workspace: {tok}"
+            # Check path-like tokens for workspace containment
+            if "/" in tok or tok.startswith("."):
+                try:
+                    resolved = (self.base / tok).resolve()
+                    if not resolved.is_relative_to(self.base):
+                        return f"❌ Shell: path outside workspace: {tok}"
+                except (ValueError, OSError):
+                    return f"❌ Shell: unresolvable path: {tok}"
         return None
 
     @staticmethod
@@ -473,12 +502,16 @@ class CodeTools(Toolkit):
         proc = subprocess.Popen(
             command, shell=True, cwd=str(self.base),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            errors="replace",
             start_new_session=True,
         )
         try:
             out, err = proc.communicate(timeout=_SHELL_TIMEOUT)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             out, err = proc.communicate()
             return f"❌ Shell: timed out after {_SHELL_TIMEOUT}s — killed: {err.strip()[:300]}"
         text = out + (("\n[stderr]\n" + err) if err.strip() else "")
