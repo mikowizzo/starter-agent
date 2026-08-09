@@ -42,9 +42,8 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [markdownPreview, setMarkdownPreview] = useState(false);
+  const [markdownPreview, setMarkdownPreview] = useState(true); // default to preview mode
   const [sidebarOpen, setSidebarOpen] = useState(true); // mobile drawer — open by default so the tree is visible
-
   // ── Track virtual keyboard height via visualViewport ──────────
   // When the mobile keyboard opens, the layout viewport shrinks.
   // We expose the offset as a CSS variable so floating elements can
@@ -117,6 +116,8 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
     async (path: string) => {
       // Don't navigate away from unsaved changes without confirm
       if (buffer && buffer.path !== path && !confirmDiscardIfDirty()) return;
+      // Reset to preview mode when switching files
+      setMarkdownPreview(true);
 
       const node = findTreeNode(treeData, path);
       if (node?.kind === "dir") {
