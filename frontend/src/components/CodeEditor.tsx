@@ -49,6 +49,9 @@ export function CodeEditor({ path, content, readOnly, onChange, onSave, markdown
       </div>
     );
   }
+  // ── Line numbers (memoized — avoids re-splitting every keystroke) ──
+  // MUST be called before any early returns — React hooks rules!
+  const lineCount = useMemo(() => content.split("\n").length, [content]);
 
   // ── Markdown preview toggle ────────────────────────────────────
   if (markdownPreview && isMarkdownFile(path)) {
@@ -64,10 +67,6 @@ export function CodeEditor({ path, content, readOnly, onChange, onSave, markdown
     );
   }
 
-  // ── Line numbers (memoized — avoids re-splitting every keystroke) ──
-  const lineCount = useMemo(() => content.split("\n").length, [content]);
-
-  // ── Code editor (textarea) ─────────────────────────────────────
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="flex min-h-0 flex-1 overflow-hidden">
