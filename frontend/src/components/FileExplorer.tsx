@@ -43,7 +43,7 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [markdownPreview, setMarkdownPreview] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(false); // mobile drawer
+  const [sidebarOpen, setSidebarOpen] = useState(true); // mobile drawer — open by default so the tree is visible
 
   // ── Track virtual keyboard height via visualViewport ──────────
   // When the mobile keyboard opens, the layout viewport shrinks.
