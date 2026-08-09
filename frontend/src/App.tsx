@@ -10,7 +10,7 @@ import {
   isActive,
 } from "./components/MessageBubble";
 import { useAgentStream } from "./hooks/useAgentStream";
-import { loadSessionHistory, fetchTeamId } from "./lib/api";
+import { loadSessionHistory, fetchTeamId, fetchIdentity } from "./lib/api";
 
 // ── Backend-ready gate ──────────────────────────────────────────────
 // Polls /health until the backend responds, then renders the app.
@@ -97,6 +97,10 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
     (async () => {
       try {
         await fetchTeamId();
+        const accent = await fetchIdentity();
+        if (accent) {
+          document.documentElement.style.setProperty("--color-accent", accent);
+        }
         if (!activeRun) {
           if (sessionId) setMessages(await loadSessionHistory(sessionId));
         }
