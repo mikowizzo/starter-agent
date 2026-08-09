@@ -1,13 +1,18 @@
 """Backend — FastAPI app entrypoint.
 
-Thin bootstrap: env validation, team construction, router wiring.
+Thin bootstrap: patches, env validation, team construction, router wiring.
 All route logic lives in app/routers/.
 """
 
 from agno.db.sqlite import SqliteDb
 from agno.os import AgentOS
 
-from app.config import BASE_DIR, DB_FILE, validate_env
+import app.patches  # noqa: F401 — agno compat patches (see app/patches.py)
+from app.config import (
+    BASE_DIR, DB_FILE,
+    SCHEDULER_BASE_URL, SCHEDULER_POLL_INTERVAL,
+    validate_env,
+)
 from app.db import init_attachment_tables
 from app.agents.coordinator import build_team
 from app.routers import sessions, settings, convert, attachments, providers, files
@@ -24,6 +29,9 @@ team = build_team(base_dir=BASE_DIR, db=db)
 app = AgentOS(
     teams=[team],
     db=db,
+    scheduler=True,
+    scheduler_poll_interval=SCHEDULER_POLL_INTERVAL,
+    scheduler_base_url=SCHEDULER_BASE_URL,
 ).get_app()
 
 # Make team available to routers via app.state
