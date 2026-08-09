@@ -78,7 +78,7 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
     function handleEsc(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
       const target = e.target as HTMLElement;
-      // Don't close if user is editing (rename input, CodeMirror, etc.)
+      // Don't close if user is editing (rename input, etc.)
       if (target.closest("input, textarea, [contenteditable], .cm-editor")) return;
       onClose();
     }

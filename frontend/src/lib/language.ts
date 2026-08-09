@@ -1,7 +1,4 @@
-// ── Language detection (no CodeMirror imports) ────────────────────
-// CodeMirror language extensions live in language-cm.ts and are only
 // loaded when the editor mounts. This module provides type detection
-// utilities that don't need CodeMirror.
 
 export function isImageFile(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase();

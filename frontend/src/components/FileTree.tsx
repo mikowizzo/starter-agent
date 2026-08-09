@@ -143,7 +143,7 @@ export function FileTree({
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
       const target = e.target as HTMLElement;
-      // Ignore if focus is in an input, textarea, or CodeMirror
+      // Ignore if focus is in an input or textarea
       if (target.closest("input, textarea, [contenteditable], .cm-editor")) return;
       if (e.key === "Delete" && selectedPath) {
         onDelete(selectedPath);
