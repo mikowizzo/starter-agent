@@ -60,6 +60,7 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
       vv.removeEventListener("resize", onResize);
       document.documentElement.style.setProperty("--keyboard-offset", "0px");
     };
+  }, []);
 
   // ── Tree loading ────────────────────────────────────────────────
 
