@@ -1,4 +1,4 @@
-import { useRef, useEffect, useMemo, useCallback } from "react";
+import { useRef, useMemo, useCallback } from "react";
 import { isImageFile, isMarkdownFile } from "../lib/language";
 import { rawUrl } from "../lib/filesApi";
 import { MarkdownRenderer } from "./MarkdownRenderer";
@@ -17,6 +17,10 @@ interface CodeEditorProps {
 
 export function CodeEditor({ path, content, readOnly, onChange, onSave, markdownPreview, isDirty }: CodeEditorProps) {
   const taRef = useRef<HTMLTextAreaElement>(null);
+
+  // ── Line numbers (memoized — avoids re-splitting every keystroke) ──
+  // MUST be before any early returns — React hooks rules!
+  const lineCount = useMemo(() => content.split("\n").length, [content]);
 
   // ── Insert text at cursor position ─────────────────────────────
   const insertAtCursor = useCallback(
@@ -49,9 +53,6 @@ export function CodeEditor({ path, content, readOnly, onChange, onSave, markdown
       </div>
     );
   }
-  // ── Line numbers (memoized — avoids re-splitting every keystroke) ──
-  // MUST be called before any early returns — React hooks rules!
-  const lineCount = useMemo(() => content.split("\n").length, [content]);
 
   // ── Markdown preview toggle ────────────────────────────────────
   if (markdownPreview && isMarkdownFile(path)) {

@@ -56,8 +56,10 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
       document.documentElement.style.setProperty("--keyboard-offset", `${offset}px`);
     };
     vv.addEventListener("resize", onResize);
-    return () => vv.removeEventListener("resize", onResize);
-  }, []);
+    return () => {
+      vv.removeEventListener("resize", onResize);
+      document.documentElement.style.setProperty("--keyboard-offset", "0px");
+    };
 
   // ── Tree loading ────────────────────────────────────────────────
 
@@ -95,11 +97,14 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
       const target = e.target as HTMLElement;
       // Don't close if user is editing (rename input, etc.)
       if (target.closest("input, textarea, [contenteditable], .cm-editor")) return;
+      if (buffer && buffer.content !== buffer.savedContent) {
+        if (!confirm("Discard unsaved changes?")) return;
+      }
       onClose();
     }
     window.addEventListener("keydown", handleEsc);
     return () => window.removeEventListener("keydown", handleEsc);
-  }, [open, onClose]);
+  }, [open, onClose, buffer]);
 
   // ── Dirty check helper ──────────────────────────────────────────
 
@@ -145,28 +150,36 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
 
       try {
         const result = await readFile(path);
-        setBuffer({
-          path,
-          content: result.content,
-          savedContent: result.content,
-          mtimeNs: result.mtime_ns,
-          loading: false,
-          error: null,
-          isBinary: false,
-        });
+        setBuffer((b) =>
+          b?.path === path
+            ? {
+                path,
+                content: result.content,
+                savedContent: result.content,
+                mtimeNs: result.mtime_ns,
+                loading: false,
+                error: null,
+                isBinary: false,
+              }
+            : b,
+        );
       } catch (e: any) {
-        setBuffer({
-          path,
-          content: "",
-          savedContent: "",
-          mtimeNs: null,
-          loading: false,
-          error:
-            e.code === "binary_file"
-              ? "Binary file — use download button to access it."
-              : e.message,
-          isBinary: e.code === "binary_file",
-        });
+        setBuffer((b) =>
+          b?.path === path
+            ? {
+                path,
+                content: "",
+                savedContent: "",
+                mtimeNs: null,
+                loading: false,
+                error:
+                  e.code === "binary_file"
+                    ? "Binary file — use download button to access it."
+                    : e.message,
+                isBinary: e.code === "binary_file",
+              }
+            : b,
+        );
       }
     },
     [treeData, buffer, confirmDiscardIfDirty],
@@ -176,15 +189,17 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
 
   const handleSave = useCallback(async () => {
     if (!buffer || buffer.content === buffer.savedContent) return;
+    const savedContent = buffer.content;
+    const savedPath = buffer.path;
     setSaving(true);
     setSaveError(null);
     try {
-      const result = await writeFile(buffer.path, buffer.content, buffer.mtimeNs);
-      setBuffer({
-        ...buffer,
-        savedContent: buffer.content,
-        mtimeNs: result.mtime_ns,
-      });
+      const result = await writeFile(savedPath, savedContent, buffer.mtimeNs);
+      setBuffer((b) =>
+        b && b.path === savedPath
+          ? { ...b, savedContent, mtimeNs: result.mtime_ns }
+          : b,
+      );
     } catch (e: any) {
       if (e.code === "conflict") {
         setSaveError(
@@ -446,6 +461,11 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
             <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center">
               <AlertCircle className="h-8 w-8 text-[var(--color-dim)]" />
               <p className="text-sm text-[var(--color-dim)]">{buffer.error}</p>
+            </div>
+          ) : buffer?.isBinary && !isImageFile(buffer.path) ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
+              <AlertCircle className="h-8 w-8 text-[var(--color-dim)]" />
+              <p className="text-sm text-[var(--color-dim)]">Binary file — use the download button to access it.</p>
             </div>
           ) : !buffer ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center">
