@@ -4,6 +4,7 @@ import ast
 import difflib
 import fcntl
 import functools
+import hashlib
 import os
 import re
 import shlex
@@ -14,6 +15,7 @@ import tempfile
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 from agno.tools import Toolkit
 
@@ -74,10 +76,7 @@ class CodeTools(Toolkit):
         self.base = Path(base_dir or ".").resolve()
         # Mutators run under the edit lock: parallel calls would otherwise
         # clobber each other's whole-file read-modify-write (lost updates).
-        # Wrap the attribute itself (not just the toolkit registration) so
-        # every call path — agno's dispatcher or direct — goes through it.
         self.write = _serialized(self.write)
-        self.edit = _serialized(self.edit)
         self.delete = _serialized(self.delete)
         self.move = _serialized(self.move)
         super().__init__(
@@ -130,42 +129,192 @@ class CodeTools(Toolkit):
 
     # ── read / write / edit ──────────────────────────────────────────────
 
+    _HASH_LEN = 16  # truncated sha256; plenty for optimistic concurrency
+
+    @staticmethod
+    def _normalize_lines(text: str) -> list[str]:
+        """Canonical form for matching and hashing.
+
+        CRLF/CR -> LF, then rstrip each line (leading whitespace preserved).
+        """
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        return [line.rstrip() for line in text.split("\n")]
+
+    @classmethod
+    def _content_hash(cls, lines: list[str]) -> str:
+        """Hash of the *normalized* content, so read() and edit() always agree."""
+        digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+        return digest[: cls._HASH_LEN]
+
+    def _read_lines(self, path: str) -> tuple[Path, list[str]] | str:
+        """Resolve + read + normalize. Returns (path, lines) or an error string."""
+        resolved = self._safe_resolve(path)
+        if isinstance(resolved, str):
+            return resolved
+        if not resolved.exists():
+            return f"❌ Not found: {path}"
+        if not resolved.is_file():
+            return f"❌ Not a regular file: {path}"
+        try:
+            text = resolved.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return f"❌ Cannot decode {path} as UTF-8 (binary file?)"
+        except OSError as exc:
+            return f"❌ Cannot read {path}: {exc}"
+        # NUL byte check — likely binary
+        if "\x00" in text[:8192]:
+            return f"❌ Binary file (NUL byte detected): {path}"
+        return resolved, self._normalize_lines(text)
+
+    @staticmethod
+    def _find_occurrences(haystack: list[str], needle: list[str]) -> list[int]:
+        """0-indexed start lines of every occurrence of needle in haystack."""
+        n = len(needle)
+        if n == 0 or n > len(haystack):
+            return []
+        first = needle[0]
+        limit = len(haystack) - n
+        return [
+            i
+            for i in range(limit + 1)
+            if haystack[i] == first and haystack[i : i + n] == needle
+        ]
+
+    @staticmethod
+    def _closest_match(
+        haystack: list[str], needle: list[str], cutoff: float = 0.55
+    ) -> tuple[float, int, list[str]] | None:
+        """Sliding-window fuzzy match; returns (ratio, start_idx, window) or None."""
+        n = len(needle)
+        if n == 0 or not haystack:
+            return None
+        if len(haystack) < n:
+            windows: list[tuple[int, list[str]]] = [(0, haystack)]
+        else:
+            windows = [(i, haystack[i : i + n]) for i in range(len(haystack) - n + 1)]
+        best_ratio, best = 0.0, None
+        for i, window in windows:
+            sm = difflib.SequenceMatcher(None, needle, window, autojunk=False)
+            if sm.real_quick_ratio() < best_ratio or sm.quick_ratio() < best_ratio:
+                continue
+            ratio = sm.ratio()
+            if ratio > best_ratio:
+                best_ratio, best = ratio, (i, window)
+        if best is None or best_ratio < cutoff:
+            return None
+        return best_ratio, best[0], best[1]
+
+    def _not_found_error(
+        self,
+        path: str,
+        lines: list[str],
+        old_lines: list[str],
+        new_lines: list[str],
+        prefix: str,
+    ) -> str:
+        parts = [f"❌ {prefix}old_string not found in {path}."]
+        # Idempotency hint: is this edit already applied?
+        already = self._find_occurrences(lines, new_lines)
+        if already:
+            where = ", ".join(str(i + 1) for i in already[:5])
+            parts.append(
+                f"HINT: new_string is already present at line(s) {where} — this edit "
+                "appears to have ALREADY BEEN APPLIED. Verify with read() before retrying."
+            )
+        # Near-match for self-correction
+        near = self._closest_match(lines, old_lines)
+        if near is not None:
+            ratio, start, window = near
+            parts.append(
+                f"Closest near-match ({ratio:.0%} similar) at line {start + 1} "
+                "(expected [-] vs actual [+]):"
+            )
+            parts.append(self._make_diff(old_lines, window, f"{path}@line{start + 1}"))
+            parts.append(
+                "Re-read the file and adjust old_string to match exactly "
+                "(indentation matters; trailing whitespace is ignored)."
+            )
+        elif not already:
+            parts.append(
+                "No similar region found — the target code has likely changed. "
+                "Re-read the file for its current contents."
+            )
+        return "\n".join(parts)
+
+    def _apply_edit(
+        self,
+        path: str,
+        lines: list[str],
+        old_string: str,
+        new_string: str,
+        replace_all: bool,
+        index: int,
+    ) -> str | None:
+        """Apply one edit to lines in place. Returns None or an error string."""
+        prefix = f"edit[{index}]: "
+        old_lines = self._normalize_lines(old_string)
+        new_lines = self._normalize_lines(new_string)
+
+        if old_lines == new_lines:
+            return f"❌ {prefix}old_string and new_string are identical — no-op edit."
+
+        hits = self._find_occurrences(lines, old_lines)
+        if not hits:
+            return self._not_found_error(path, lines, old_lines, new_lines, prefix)
+
+        if replace_all:
+            for start in reversed(hits):
+                lines[start : start + len(old_lines)] = new_lines
+            return None
+
+        if len(hits) > 1:
+            where = ", ".join(str(h + 1) for h in hits[:10])
+            return (
+                f"❌ {prefix}old_string matches {len(hits)} locations (lines {where}) "
+                "but replace_all is false. Include more context or set replace_all=true."
+            )
+
+        start = hits[0]
+        lines[start : start + len(old_lines)] = new_lines
+        return None
+
     def read(self, path: str, offset: int = 0, limit: int = 500) -> str:
         """Read a file slice by line number. Output has 1-indexed line numbers.
+
+        The header includes a content hash. Pass that hash as `expected_hash`
+        to `edit()` for optimistic concurrency — if the file changed since you
+        read it, the edit is refused.
 
         Args:
             path: Relative path to the file.
             offset: Zero-based line to start reading from.
             limit: Max lines to return (hard-capped at 2000).
         """
-        p = self._safe_resolve(path)
-        if isinstance(p, str):
-            return p
-        if not p.is_file():
-            return f"❌ Not found: {p}"
-        if offset < 0:
-            return "❌ offset must be >= 0"
-        if limit <= 0:
-            return "❌ limit must be > 0"
-        try:
-            lines = p.read_text(encoding="utf-8").split("\n")
-        except UnicodeDecodeError:
-            return f"❌ Binary file (not valid UTF-8): {path}"
+        result = self._read_lines(path)
+        if isinstance(result, str):
+            return result
+        _resolved, lines = result
         total = len(lines)
+        file_hash = self._content_hash(lines)
+
         if total == 0 or (total == 1 and lines[0] == ""):
             return f"⚠️ Empty file: {path}"
+        if offset < 0:
+            return "❌ offset must be >= 0"
         if offset >= total:
-            return (
-                f"❌ offset {offset} is past end of file ({total} lines). Use offset=0."
-            )
+            return f"❌ offset {offset} is past end of file ({total} lines). Use offset=0."
+        if limit <= 0:
+            return "❌ limit must be > 0"
+
         slice_lines = lines[offset : offset + min(limit, 2000)]
         end = offset + len(slice_lines)
         width = len(str(end))
         numbered = [
             f"{offset + i + 1:>{width}}: {line}" for i, line in enumerate(slice_lines)
         ]
-        out = f"[lines {offset + 1}\u2013{end} of {total} in {path}]\n" + "\n".join(
-            numbered
+        out = (
+            f"[lines {offset + 1}–{end} of {total} in {path} | hash={file_hash}]\n"
+            + "\n".join(numbered)
         )
         if end < total:
             out += f"\n[read more with offset={end}]"
@@ -184,122 +333,111 @@ class CodeTools(Toolkit):
         p.write_text(content, encoding="utf-8")
         return f"✅ Wrote {content.count(chr(10)) + 1} lines to {p}"
 
+    @_serialized
     def edit(
         self,
         path: str,
-        search: str = "",
-        replace: str = "",
-        *,
-        old_start: int | None = None,
-        old_end: int | None = None,
-        old_content: str | None = None,
-        replace_all: bool = False,
-        dry_run: bool = False,
+        edits: list[dict[str, Any]] | None = None,
+        expected_hash: str | None = None,
     ) -> str:
-        """Edit a file by line range or exact string search.
+        """Apply one or more search-and-replace edits to a file, atomically.
 
-        Provide EXACTLY ONE of:
-          - old_start AND old_end (1-indexed, inclusive): replace that line range
-            with `replace`. Preferred mode — pairs with read()'s line numbers.
-          - search: replace matched text with `replace`. Must match exactly once
-            unless replace_all=True.
+        Each edit replaces an exact block of text (old_string) with new text
+        (new_string). Edits are applied in order — each edit sees the results
+        of the previous ones. The batch is atomic: if ANY edit fails, NOTHING
+        is written to disk.
+
+        Matching rules:
+          - old_string must match the file content exactly, EXCEPT that trailing
+            whitespace per line and CRLF-vs-LF differences are ignored (leading
+            whitespace / indentation must match exactly).
+          - By default old_string must match exactly ONE location; if it matches
+            several, add more surrounding context or set replace_all to true.
+
+        For Python (.py) files, the result is syntax-checked before writing.
 
         Args:
-            path: File to edit.
-            search: Text to find and replace (search mode).
-            replace: Replacement text.
-            old_start: First line number (1-indexed, line-range mode).
-            old_end: Last line number (1-indexed, inclusive).
-            old_content: Expected content of lines old_start..old_end (safety check
-                          for line-range mode). If the actual lines differ, the edit
-                          is refused — prevents silent mangling from stale line numbers.
-            replace_all: Allow >1 matches (search mode only).
-            dry_run: Return diff without writing.
-        Returns status + unified diff on success; ❌ on failure.
-        Line-range edits report line-shift info for subsequent edits.
-        Python files are syntax-checked before write.
+            path: File to edit, relative to the workspace root.
+            edits: List of edit objects, each with keys:
+                - "old_string" (str, required): text to find.
+                - "new_string" (str, required): replacement text.
+                - "replace_all" (bool, optional, default false): replace all
+                  occurrences instead of requiring a unique match.
+                Example: [{"old_string": "def f():\\n    pass",
+                           "new_string": "def f():\\n    return 1"}]
+            expected_hash: Optional hash from a prior read()/edit() call. If
+                provided and the file's current hash differs, the edit is
+                rejected (re-read the file and retry).
+
+        Returns:
+            On success: '✅' summary with old/new hashes + unified diff.
+            On failure: '❌' error with details for self-correction.
         """
-        p = self._safe_resolve(path)
-        if isinstance(p, str):
-            return p
-        if not p.is_file():
-            return f"❌ Not found: {p}"
-
-        line_mode = old_start is not None or old_end is not None
-        if line_mode and search:
-            return "❌ Ambiguous: provide line range (old_start/old_end) OR search, not both."
-        if not line_mode and not search:
-            return "❌ Nothing to edit: provide either search or old_start/old_end."
-
-        try:
-            raw = p.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return f"❌ Not a UTF-8 text file, refusing to edit (would corrupt binary data): {path}"
-        # NUL byte check — likely binary
-        if "\x00" in raw[:8192]:
-            return f"❌ Binary file (NUL byte detected), refusing to edit: {path}"
-        src_lines = raw.split("\n")
-
-        if line_mode:
-            if old_start is None or old_end is None:
-                return "❌ Both old_start and old_end are required for line-range mode."
-            if old_start < 1:
-                return f"❌ old_start must be >= 1 (got {old_start})."
-            if old_end < old_start:
-                return f"❌ old_end ({old_end}) must be >= old_start ({old_start})."
-            if old_end > len(src_lines):
-                return f"❌ old_end ({old_end}) is past end of file ({len(src_lines)} lines)."
-
-            old_block = "\n".join(src_lines[old_start - 1 : old_end])
-            # Context validation: refuse if the actual lines don't match what
-            # the caller expected. Prevents silent mangling from stale line numbers.
-            if old_content is not None and old_content.strip() != old_block.strip():
+        if not edits:
+            return "❌ edits list is empty — provide at least one edit."
+        for i, e in enumerate(edits):
+            if not isinstance(e, dict):
+                return f"❌ edits[{i}] must be an object with old_string/new_string."
+            old, new = e.get("old_string"), e.get("new_string")
+            if not isinstance(old, str) or not isinstance(new, str):
                 return (
-                    f"❌ Line-range mismatch: lines {old_start}–{old_end} don't match "
-                    f"expected content. File may have changed since last read.\n"
-                    f"  Expected: {old_content[:120]!r}\n"
-                    f"  Actual:   {old_block[:120]!r}"
+                    f"❌ edits[{i}] requires string fields 'old_string' and 'new_string'."
                 )
-            replace_lines = replace.split("\n")
-            new_lines = src_lines[: old_start - 1] + replace_lines + src_lines[old_end:]
-        else:
-            if not search.strip():
-                return "❌ Empty search string."
-            src = "\n".join(src_lines)
-            count = src.count(search)
-            if count == 0:
-                return "❌ Search string not found."
-            if count > 1 and not replace_all:
-                return (
-                    f"❌ Expected 1 match, found {count}. "
-                    f"Use replace_all=True or provide old_start/old_end."
-                )
-            new_src = src.replace(search, replace)
-            new_lines = new_src.split("\n")
+            if old == "":
+                return f"❌ edits[{i}]: old_string must not be empty."
+            if not isinstance(e.get("replace_all", False), bool):
+                return f"❌ edits[{i}]: 'replace_all' must be a boolean."
 
-        new_text = "\n".join(new_lines)
-        if p.suffix.lower() == ".py":
+        result = self._read_lines(path)
+        if isinstance(result, str):
+            return result
+        resolved, original = result
+
+        current_hash = self._content_hash(original)
+        if expected_hash is not None and expected_hash != current_hash:
+            return (
+                f"❌ Hash mismatch for {path}: expected {expected_hash}, "
+                f"current {current_hash}. The file changed — re-read and retry."
+            )
+
+        working = list(original)
+        for i, e in enumerate(edits):
+            err = self._apply_edit(
+                path,
+                working,
+                e["old_string"],
+                e["new_string"],
+                e.get("replace_all", False),
+                i,
+            )
+            if err is not None:
+                return err
+
+        if working == original:
+            return f"❌ No changes to {path} — all edits were no-ops."
+
+        new_text = "\n".join(working)
+        if resolved.suffix.lower() == ".py":
             try:
                 ast.parse(new_text)
-            except SyntaxError as e:
-                return f"❌ Would break syntax: {e.msg}"
+            except SyntaxError as exc:
+                return (
+                    f"❌ Edit rejected — result is not valid Python: {exc.msg} "
+                    f"(line {exc.lineno}). No changes were written."
+                )
 
-        diff = self._make_diff(src_lines, new_lines, path)
-        diff_lines = diff.splitlines()
-        added = sum(1 for d in diff_lines if d.startswith("+") and not d.startswith("+++"))
-        removed = sum(1 for d in diff_lines if d.startswith("-") and not d.startswith("---"))
-        summary = f"✅ Edited {path} (+{added}/-{removed} lines)"
+        try:
+            resolved.write_text(new_text, encoding="utf-8")
+        except OSError as exc:
+            return f"❌ Failed to write {path}: {exc}"
 
-        # Report line-shift info for line-range edits (helps with consecutive edits)
-        if line_mode and old_end is not None:
-            delta = len(replace_lines) - (old_end - old_start + 1)
-            if delta != 0:
-                summary += f" [lines after {old_end} shifted by {delta:+d}]"
-
-        if dry_run:
-            return f"{summary} [dry-run]\n{diff}"
-        p.write_text(new_text, encoding="utf-8")
-        return f"{summary}\n{diff}"
+        new_hash = self._content_hash(working)
+        diff = self._make_diff(original, working, path)
+        return (
+            f"✅ Applied {len(edits)} edit(s) to {path} "
+            f"({len(original)} → {len(working)} lines, "
+            f"hash {current_hash} → {new_hash})\n{diff}"
+        )
 
     @staticmethod
     def _make_diff(old_lines: list[str], new_lines: list[str], path: str) -> str:
