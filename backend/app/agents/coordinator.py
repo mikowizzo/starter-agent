@@ -11,12 +11,14 @@ from agno.db.sqlite import SqliteDb
 from agno.skills import LocalSkills, Skills
 from agno.skills.errors import SkillValidationError
 from agno.team import Team
+from agno.team._init import generate_id_from_name
 
 from app.models import primary_model
 from app.tools.attachment_tools import AttachmentTools
 from app.tools.code_tools import CodeTools
 from app.tools.clone_tools import CloneTools
 from app.tools.team_comms import TeamComms
+from agno.tools.scheduler import SchedulerTools
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,11 @@ def build_team(
             AttachmentTools(),
             CloneTools(team_name=team_name),
             TeamComms(),
+            SchedulerTools(
+                db=db,
+                default_endpoint=f"/teams/{generate_id_from_name(team_name)}/runs",
+                default_timezone="UTC",
+            ),
         ],
         skills=skills,
         markdown=True,
