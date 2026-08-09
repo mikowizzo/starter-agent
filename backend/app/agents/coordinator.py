@@ -89,9 +89,9 @@ def build_team(
         add_datetime_to_context=True,
         timezone_identifier="UTC",
         add_location_to_context=True,
-        num_history_runs=20,
+        num_history_runs=10,
         # ── Run containment ─────────────────────────────────────────────
-        tool_call_limit=25,
+        tool_call_limit=20,
         cache_session=True,
         tools=[
             code_tools,
