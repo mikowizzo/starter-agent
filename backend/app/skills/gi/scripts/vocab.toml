@@ -1,0 +1,74 @@
+# Relation vocabulary — data, not code. Edit freely; `gi check` warns on drift.
+
+[employs]
+inverse = "employed_by"
+domain = "organization"
+range = "person"
+
+[director_of]
+inverse = "directed_by"
+domain = "person"
+range = "organization"
+
+[parent_of]
+inverse = "subsidiary_of"
+
+[subsidiary_of]
+inverse = "parent_of"
+
+[group_member_of]
+inverse = "group_of"
+
+[responsible_entity]
+domain = "licensee"
+range = "fund"
+
+[investment_manager]
+inverse = "managed_by"
+
+[embodied_as]
+domain = "fund"
+range = "trust"
+
+[invests_in]
+
+[holds_licence]
+domain = "licensee"
+range = "licence"
+
+[custodian]
+domain = "organization"
+range = "fund"
+
+[auditor]
+
+[administrator]
+
+[competitor_of]
+symmetric = true
+
+[headquartered_in]
+domain = "organization"
+range = "place"
+
+[founded_by]
+inverse = "founded"
+
+[knows]
+symmetric = true
+
+[provides]
+domain = "organization"
+range = "artifact"
+
+[requires]
+domain = "account"
+range = "artifact"
+
+[implements]
+domain = "organization"
+range = "artifact"
+
+[likely-is]
+domain = "organization"
+range = "organization"
