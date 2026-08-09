@@ -148,7 +148,7 @@ class CodeTools(Toolkit):
         if limit <= 0:
             return "❌ limit must be > 0"
         try:
-            lines = p.read_text(encoding="utf-8").splitlines()
+            lines = p.read_text(encoding="utf-8").split("\n")
         except UnicodeDecodeError:
             return f"❌ Binary file (not valid UTF-8): {path}"
         total = len(lines)
@@ -192,6 +192,7 @@ class CodeTools(Toolkit):
         *,
         old_start: int | None = None,
         old_end: int | None = None,
+        old_content: str | None = None,
         replace_all: bool = False,
         dry_run: bool = False,
     ) -> str:
@@ -209,6 +210,9 @@ class CodeTools(Toolkit):
             replace: Replacement text.
             old_start: First line number (1-indexed, line-range mode).
             old_end: Last line number (1-indexed, inclusive).
+            old_content: Expected content of lines old_start..old_end (safety check
+                          for line-range mode). If the actual lines differ, the edit
+                          is refused — prevents silent mangling from stale line numbers.
             replace_all: Allow >1 matches (search mode only).
             dry_run: Return diff without writing.
         Returns status + unified diff on success; ❌ on failure.
@@ -234,7 +238,7 @@ class CodeTools(Toolkit):
         # NUL byte check — likely binary
         if "\x00" in raw[:8192]:
             return f"❌ Binary file (NUL byte detected), refusing to edit: {path}"
-        src_lines = raw.splitlines(keepends=True)
+        src_lines = raw.split("\n")
 
         if line_mode:
             if old_start is None or old_end is None:
@@ -246,14 +250,22 @@ class CodeTools(Toolkit):
             if old_end > len(src_lines):
                 return f"❌ old_end ({old_end}) is past end of file ({len(src_lines)} lines)."
 
-            replace_lines = replace.splitlines(keepends=True)
-            if replace and not replace.endswith("\n"):
-                replace_lines[-1] += "\n"
+            old_block = "\n".join(src_lines[old_start - 1 : old_end])
+            # Context validation: refuse if the actual lines don't match what
+            # the caller expected. Prevents silent mangling from stale line numbers.
+            if old_content is not None and old_content.strip() != old_block.strip():
+                return (
+                    f"❌ Line-range mismatch: lines {old_start}–{old_end} don't match "
+                    f"expected content. File may have changed since last read.\n"
+                    f"  Expected: {old_content[:120]!r}\n"
+                    f"  Actual:   {old_block[:120]!r}"
+                )
+            replace_lines = replace.split("\n")
             new_lines = src_lines[: old_start - 1] + replace_lines + src_lines[old_end:]
         else:
             if not search.strip():
                 return "❌ Empty search string."
-            src = "".join(src_lines)
+            src = "\n".join(src_lines)
             count = src.count(search)
             if count == 0:
                 return "❌ Search string not found."
@@ -262,9 +274,10 @@ class CodeTools(Toolkit):
                     f"❌ Expected 1 match, found {count}. "
                     f"Use replace_all=True or provide old_start/old_end."
                 )
-            new_lines = src.replace(search, replace).splitlines(keepends=True)
+            new_src = src.replace(search, replace)
+            new_lines = new_src.split("\n")
 
-        new_text = "".join(new_lines)
+        new_text = "\n".join(new_lines)
         if p.suffix.lower() == ".py":
             try:
                 ast.parse(new_text)
