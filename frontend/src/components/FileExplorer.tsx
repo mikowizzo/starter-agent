@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { Loader2, X, Save, RotateCcw, AlertCircle, FileText, Eye, Pencil, Download } from "lucide-react";
+import { Loader2, X, Save, RotateCcw, AlertCircle, FileText, Eye, Pencil, Download, Menu, Folder } from "lucide-react";
 import { FileTree } from "./FileTree";
 import { CodeEditor } from "./CodeEditor";
 import {
@@ -43,6 +43,22 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [markdownPreview, setMarkdownPreview] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false); // mobile drawer
+
+  // ── Track virtual keyboard height via visualViewport ──────────
+  // When the mobile keyboard opens, the layout viewport shrinks.
+  // We expose the offset as a CSS variable so floating elements can
+  // sit above the keyboard.
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const onResize = () => {
+      const offset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+      document.documentElement.style.setProperty("--keyboard-offset", `${offset}px`);
+    };
+    vv.addEventListener("resize", onResize);
+    return () => vv.removeEventListener("resize", onResize);
+  }, []);
 
   // ── Tree loading ────────────────────────────────────────────────
 
@@ -357,8 +373,33 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
 
       {/* Body: tree | editor */}
       <div className="flex min-h-0 flex-1">
-        {/* Sidebar */}
-        <aside className="flex w-64 shrink-0 flex-col border-r border-[var(--color-border)]">
+        {/* Mobile sidebar backdrop */}
+        {sidebarOpen && (
+          <div
+            className="fixed inset-0 z-[80] bg-black/50 md:hidden"
+            onClick={() => setSidebarOpen(false)}
+          />
+        )}
+
+        {/* Sidebar — always visible on desktop, drawer on mobile */}
+        <aside
+          className={`absolute z-[81] flex h-full w-64 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-bg)] transition-transform duration-200 md:static md:translate-x-0 ${
+            sidebarOpen ? "translate-x-0" : "-translate-x-full"
+          }`}
+        >
+          {/* Mobile sidebar header */}
+          <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-2.5 md:hidden">
+            <span className="flex items-center gap-2 text-sm font-semibold text-[var(--color-text)]">
+              <Folder className="h-4 w-4 text-[var(--color-accent)]" />
+              Files
+            </span>
+            <button
+              onClick={() => setSidebarOpen(false)}
+              className="rounded-lg p-1.5 text-[var(--color-dim)] transition hover:bg-[var(--color-border)]"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
           {treeLoading ? (
             <div className="flex justify-center py-8">
               <Loader2 className="h-5 w-5 animate-spin text-[var(--color-dim)]" />
@@ -374,7 +415,10 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
               data={treeData}
               selectedPath={selectedPath}
               dirtyPaths={dirtyPaths}
-              onSelect={handleSelect}
+              onSelect={(p) => {
+                handleSelect(p);
+                setSidebarOpen(false); // close drawer on mobile after selecting
+              }}
               onRename={handleRename}
               onCreate={handleCreate}
               onDelete={handleDelete}
@@ -385,6 +429,14 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
 
         {/* Editor pane */}
         <main className="flex min-w-0 min-h-0 flex-1 flex-col">
+          {/* Mobile: open-files button when no buffer or to switch files */}
+          <button
+            onClick={() => setSidebarOpen(true)}
+            className="flex items-center gap-2 border-b border-[var(--color-border)] px-3 py-2 md:hidden"
+          >
+            <Menu className="h-4 w-4 text-[var(--color-accent)]" />
+            <span className="text-sm text-[var(--color-dim)]">Browse files</span>
+          </button>
           {buffer?.loading ? (
             <div className="flex flex-1 items-center justify-center">
               <Loader2 className="h-5 w-5 animate-spin text-[var(--color-dim)]" />
@@ -410,7 +462,7 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
                   <span className="text-[10px] text-[var(--color-accent)]">● unsaved</span>
                 )}
                 <div className="flex-1" />
-                <span className="text-[10px] text-[var(--color-dim)]">
+                <span className="hidden text-[10px] text-[var(--color-dim)] sm:inline">
                   {languageLabel(buffer.path)}
                 </span>
 
@@ -456,12 +508,12 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
                   </button>
                 )}
 
-                {/* Save button (hidden for binary/image files) */}
+                {/* Save button — desktop only; mobile uses toolbar in CodeEditor */}
                 {!buffer.isBinary && (
                   <button
                     onClick={handleSave}
                     disabled={!isDirty || saving}
-                    className="flex items-center gap-1.5 rounded-md px-3 py-1 text-[12px] font-medium text-[var(--color-text)] transition hover:text-[var(--color-accent)] active:scale-[0.97] disabled:opacity-30"
+                    className="hidden items-center gap-1.5 rounded-md px-3 py-1 text-[12px] font-medium text-[var(--color-text)] transition hover:text-[var(--color-accent)] active:scale-[0.97] disabled:opacity-30 md:flex"
                   >
                     {saving ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -483,6 +535,7 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
                 }
                 onSave={handleSave}
                 markdownPreview={markdownPreview}
+                isDirty={isDirty}
               />
             </>
           )}
@@ -491,14 +544,14 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
 
       {/* Footer hint */}
       <div className="flex items-center justify-between border-t border-[var(--color-border)] px-4 py-1.5 text-[10px] text-[var(--color-dim)]">
-        <span>
+        <span className="truncate">
           {buffer && !buffer.isBinary
             ? `${languageLabel(buffer.path)} · ${buffer.content.split("\n").length} lines`
             : buffer?.isBinary
               ? "Binary file"
               : "No file open"}
         </span>
-        <span>ESC to close · ⌘S to save · Drag files to move</span>
+        <span className="hidden sm:inline">ESC to close · ⌘S to save · Drag files to move</span>
       </div>
     </div>
   );

@@ -37,10 +37,20 @@ body,
   height: 100%;
   background: var(--color-bg);
 }
-
 html,
 body {
   overscroll-behavior: none;
+}
+
+/* ── Mobile editor font-size: prevent iOS Safari auto-zoom on focus ────
+   iOS zooms the page when an input < 16px is focused and doesn't always
+   zoom back out. We use 16px on touch / small screens to avoid this. */
+@media (max-width: 768px) {
+  .code-textarea,
+  .code-gutter {
+    font-size: 16px !important;
+    line-height: 1.5 !important;
+  }
 }
 
 
