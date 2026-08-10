@@ -131,14 +131,82 @@ class CodeTools(Toolkit):
 
     _HASH_LEN = 16  # truncated sha256; plenty for optimistic concurrency
 
-    @staticmethod
-    def _normalize_lines(text: str) -> list[str]:
+    #: Unicode confusables → ASCII for MATCHING ONLY (never written to disk).
+    #: Covers smart quotes, dashes, hyphens, spaces, invisible chars, and
+    #: bidi controls (Trojan Source, CVE-2021-42574).
+    _ASCII_TRANSLATION = str.maketrans({
+        # Smart quotes
+        "\u2018": "'",  # left single quote
+        "\u2019": "'",  # right single quote / curly apostrophe
+        "\u201a": "'",  # single low-9 quote
+        "\u201c": '"',  # left double quote
+        "\u201d": '"',  # right double quote
+        "\u201e": '"',  # double low-9 quote
+        # Primes & acutes
+        "\u2032": "'",  # prime
+        "\u2033": '"',  # double prime
+        "\u2035": "`",  # reversed prime
+        "\u00b4": "'",  # acute accent
+        "\u02bc": "'",  # modifier letter apostrophe
+        # Dashes & hyphens
+        "\u2013": "-",  # en dash
+        "\u2014": "-",  # em dash
+        "\u2212": "-",  # minus sign
+        "\u2010": "-",  # hyphen
+        "\u2011": "-",  # non-breaking hyphen
+        # Ellipsis
+        "\u2026": "...",  # horizontal ellipsis
+        # Spaces → regular space
+        "\u00a0": " ",  # non-breaking space
+        "\u2002": " ",  # en space
+        "\u2003": " ",  # em space
+        "\u2004": " ",  # three-per-em space
+        "\u2005": " ",  # four-per-em space
+        "\u2006": " ",  # six-per-em space
+        "\u2007": " ",  # figure space
+        "\u2008": " ",  # punctuation space
+        "\u2009": " ",  # thin space
+        "\u200a": " ",  # hair space
+        "\u202f": " ",  # narrow no-break space
+        "\u205f": " ",  # medium mathematical space
+        "\u3000": " ",  # ideographic space (CJK)
+        # Invisible / zero-width → stripped
+        "\u200b": "",   # zero-width space
+        "\u200c": "",   # zero-width non-joiner
+        "\u200d": "",   # zero-width joiner
+        "\u2060": "",   # word joiner
+        "\u00ad": "",   # soft hyphen
+        "\ufeff": "",   # BOM / zero-width no-break space
+        # Bidi controls (Trojan Source, CVE-2021-42574) → stripped
+        "\u202a": "", "\u202b": "", "\u202c": "", "\u202d": "", "\u202e": "",
+        "\u2066": "", "\u2067": "", "\u2068": "", "\u2069": "",
+    })
+
+    @classmethod
+    def _normalize_line(cls, line: str) -> str:
+        """Normalize a single line for matching/hashing (never written to disk)."""
+        return line.translate(cls._ASCII_TRANSLATION).rstrip()
+
+    @classmethod
+    def _normalize_lines(cls, text: str) -> list[str]:
         """Canonical form for matching and hashing.
 
-        CRLF/CR -> LF, then rstrip each line (leading whitespace preserved).
+        CRLF/CR → LF, Unicode confusables → ASCII, rstrip each line
+        (leading whitespace preserved).  Used ONLY for matching and hashing
+        — never for display or writing.
         """
         text = text.replace("\r\n", "\n").replace("\r", "\n")
-        return [line.rstrip() for line in text.split("\n")]
+        return [cls._normalize_line(line) for line in text.split("\n")]
+
+    @staticmethod
+    def _split_lines(text: str) -> list[str]:
+        """Split text into lines with CRLF/CR normalised to LF.
+
+        Preserves all content (Unicode, trailing whitespace) — use for raw
+        lines that will be written back to disk.
+        """
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        return text.split("\n")
 
     @classmethod
     def _content_hash(cls, lines: list[str]) -> str:
@@ -146,8 +214,13 @@ class CodeTools(Toolkit):
         digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
         return digest[: cls._HASH_LEN]
 
-    def _read_lines(self, path: str) -> tuple[Path, list[str]] | str:
-        """Resolve + read + normalize. Returns (path, lines) or an error string."""
+    def _read_lines(self, path: str) -> tuple[Path, list[str], list[str]] | str:
+        """Resolve + read file. Returns (path, raw_lines, norm_lines) or error.
+
+        raw_lines preserve original content for writing back to disk.
+        norm_lines are used for matching and hashing.
+        The two lists are parallel: raw_lines[i] corresponds to norm_lines[i].
+        """
         resolved = self._safe_resolve(path)
         if isinstance(resolved, str):
             return resolved
@@ -164,7 +237,9 @@ class CodeTools(Toolkit):
         # NUL byte check — likely binary
         if "\x00" in text[:8192]:
             return f"❌ Binary file (NUL byte detected): {path}"
-        return resolved, self._normalize_lines(text)
+        raw_lines = self._split_lines(text)
+        norm_lines = [self._normalize_line(l) for l in raw_lines]
+        return resolved, raw_lines, norm_lines
 
     @staticmethod
     def _find_occurrences(haystack: list[str], needle: list[str]) -> list[int]:
@@ -244,27 +319,40 @@ class CodeTools(Toolkit):
     def _apply_edit(
         self,
         path: str,
-        lines: list[str],
+        raw_lines: list[str],
+        norm_lines: list[str],
         old_string: str,
         new_string: str,
         replace_all: bool,
         index: int,
     ) -> str | None:
-        """Apply one edit to lines in place. Returns None or an error string."""
-        prefix = f"edit[{index}]: "
-        old_lines = self._normalize_lines(old_string)
-        new_lines = self._normalize_lines(new_string)
+        """Apply one edit to raw_lines/norm_lines in place (parallel mutation).
 
-        if old_lines == new_lines:
+        Matching uses norm_lines; splicing uses raw_lines. Both arrays are
+        mutated in lockstep to remain parallel. new_string is inserted raw
+        (never normalized) so Unicode content is preserved on write.
+        """
+        prefix = f"edit[{index}]: "
+        old_norm = self._normalize_lines(old_string)
+        new_norm = self._normalize_lines(new_string)
+
+        if old_norm == new_norm:
             return f"❌ {prefix}old_string and new_string are identical — no-op edit."
 
-        hits = self._find_occurrences(lines, old_lines)
+        hits = self._find_occurrences(norm_lines, old_norm)
         if not hits:
-            return self._not_found_error(path, lines, old_lines, new_lines, prefix)
+            return self._not_found_error(
+                path, norm_lines, old_norm, new_norm, prefix
+            )
+
+        # new_string lines: raw for splicing into raw_lines, normalized for
+        # keeping norm_lines parallel.
+        new_raw = self._split_lines(new_string)
 
         if replace_all:
             for start in reversed(hits):
-                lines[start : start + len(old_lines)] = new_lines
+                raw_lines[start : start + len(old_norm)] = new_raw
+                norm_lines[start : start + len(old_norm)] = new_norm
             return None
 
         if len(hits) > 1:
@@ -275,7 +363,8 @@ class CodeTools(Toolkit):
             )
 
         start = hits[0]
-        lines[start : start + len(old_lines)] = new_lines
+        raw_lines[start : start + len(old_norm)] = new_raw
+        norm_lines[start : start + len(old_norm)] = new_norm
         return None
 
     def read(self, path: str, offset: int = 0, limit: int = 500) -> str:
@@ -293,11 +382,11 @@ class CodeTools(Toolkit):
         result = self._read_lines(path)
         if isinstance(result, str):
             return result
-        _resolved, lines = result
-        total = len(lines)
-        file_hash = self._content_hash(lines)
+        _resolved, raw_lines, norm_lines = result
+        total = len(raw_lines)
+        file_hash = self._content_hash(norm_lines)
 
-        if total == 0 or (total == 1 and lines[0] == ""):
+        if total == 0 or (total == 1 and raw_lines[0] == ""):
             return f"⚠️ Empty file: {path}"
         if offset < 0:
             return "❌ offset must be >= 0"
@@ -306,7 +395,7 @@ class CodeTools(Toolkit):
         if limit <= 0:
             return "❌ limit must be > 0"
 
-        slice_lines = lines[offset : offset + min(limit, 2000)]
+        slice_lines = raw_lines[offset : offset + min(limit, 2000)]
         end = offset + len(slice_lines)
         width = len(str(end))
         numbered = [
@@ -349,8 +438,10 @@ class CodeTools(Toolkit):
 
         Matching rules:
           - old_string must match the file content exactly, EXCEPT that trailing
-            whitespace per line and CRLF-vs-LF differences are ignored (leading
-            whitespace / indentation must match exactly).
+            whitespace per line, CRLF-vs-LF differences, and common Unicode
+            confusables (smart quotes, em/en dashes, non-breaking spaces, etc.)
+            are normalized to ASCII (leading whitespace / indentation must match
+            exactly).
           - By default old_string must match exactly ONE location; if it matches
             several, add more surrounding context or set replace_all to true.
 
@@ -391,20 +482,23 @@ class CodeTools(Toolkit):
         result = self._read_lines(path)
         if isinstance(result, str):
             return result
-        resolved, original = result
+        resolved, raw_original, norm_original = result
 
-        current_hash = self._content_hash(original)
+        current_hash = self._content_hash(norm_original)
         if expected_hash is not None and expected_hash != current_hash:
             return (
                 f"❌ Hash mismatch for {path}: expected {expected_hash}, "
                 f"current {current_hash}. The file changed — re-read and retry."
             )
 
-        working = list(original)
+        # Parallel working copies: raw (for writing) and norm (for matching).
+        raw_working = list(raw_original)
+        norm_working = list(norm_original)
         for i, e in enumerate(edits):
             err = self._apply_edit(
                 path,
-                working,
+                raw_working,
+                norm_working,
                 e["old_string"],
                 e["new_string"],
                 e.get("replace_all", False),
@@ -413,10 +507,10 @@ class CodeTools(Toolkit):
             if err is not None:
                 return err
 
-        if working == original:
+        if raw_working == raw_original:
             return f"❌ No changes to {path} — all edits were no-ops."
 
-        new_text = "\n".join(working)
+        new_text = "\n".join(raw_working)
         if resolved.suffix.lower() == ".py":
             try:
                 ast.parse(new_text)
@@ -431,11 +525,11 @@ class CodeTools(Toolkit):
         except OSError as exc:
             return f"❌ Failed to write {path}: {exc}"
 
-        new_hash = self._content_hash(working)
-        diff = self._make_diff(original, working, path)
+        new_hash = self._content_hash(norm_working)
+        diff = self._make_diff(raw_original, raw_working, path)
         return (
             f"✅ Applied {len(edits)} edit(s) to {path} "
-            f"({len(original)} → {len(working)} lines, "
+            f"({len(raw_original)} → {len(raw_working)} lines, "
             f"hash {current_hash} → {new_hash})\n{diff}"
         )
 

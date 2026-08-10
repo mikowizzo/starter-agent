@@ -109,15 +109,15 @@ def save_public(img_bytes: bytes, prompt: str) -> str:
 def generate_authed(prompt, model, width, height, key):
     """Generate via the authenticated endpoint (real model, e.g. zimage).
 
-    gen.pollinations.ai image URLs require the API key to view, so fetch
-    the bytes, save them into the frontend public folder, and return the
-    /generated/<file> display URL (viewable without auth).
+    Requests b64_json so image bytes arrive inline in the single generation
+    POST — no second (billed) GET of the image URL.  Saves into the frontend
+    public folder and returns the /generated/<file> display URL.
     """
     payload = {
         "model": model,
         "prompt": prompt,
         "size": f"{width}x{height}",
-        "response_format": "url",
+        "response_format": "b64_json",
     }
     req = urllib.request.Request(
         AUTH_URL,
@@ -143,8 +143,19 @@ def generate_authed(prompt, model, width, height, key):
         print(f"ERROR: no image in response: {json.dumps(data)[:500]}", file=sys.stderr)
         sys.exit(1)
 
+    b64 = item.get("b64_json")
+    if b64:
+        return save_public(base64.b64decode(b64), prompt)
+
+    # Defensive fallback: server ignored response_format=b64_json and returned
+    # a URL instead — fetch it (possible double charge).
     url = item.get("url")
     if url and url.startswith(("http://", "https://")):
+        print(
+            "WARNING: server ignored response_format=b64_json; "
+            "fetching URL (possible double charge)",
+            file=sys.stderr,
+        )
         img_req = urllib.request.Request(
             url,
             headers={"Authorization": f"Bearer {key}", "User-Agent": USER_AGENT},
@@ -160,9 +171,6 @@ def generate_authed(prompt, model, width, height, key):
             sys.exit(1)
         return save_public(img, prompt)
 
-    b64 = item.get("b64_json")
-    if b64:
-        return save_public(base64.b64decode(b64), prompt)
     print(f"ERROR: no image in response: {json.dumps(data)[:500]}", file=sys.stderr)
     sys.exit(1)
 
