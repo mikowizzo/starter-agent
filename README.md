@@ -2,6 +2,8 @@
 
 A personal AI assistant you can run on your own machine. Powered by [OpenCode](https://opencode.ai), built with agno, FastAPI, React, and Docker.
 
+> **TL;DR** — `git clone`, add your API key, `docker compose up`, open `localhost:3000`. Done.
+
 ## Quick Start
 
 **1. Clone the repo**
@@ -79,7 +81,7 @@ internet. For more, see the [Tailscale getting started guide](https://tailscale.
 | Agent personality | `backend/app/agents/coordinator.py` |
 | AI model | `backend/app/models.py` |
 | Tools | `backend/app/tools/code_tools.py` |
-| Add skills | Drop a folder with `SKILL.md` in `backend/app/skills/` |
+| Add skills | Create a folder in `backend/app/skills/` with a `SKILL.md` |
 | Self-cloning | `backend/app/tools/clone_tools.py` — the agent can spawn independent copies of itself |
 
 ## Built with

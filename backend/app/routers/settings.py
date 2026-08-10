@@ -123,13 +123,6 @@ async def get_clones(request: Request):
         "clones": clones,
     }
 
-@router.get("/identity")
-async def get_identity(request: Request):
-    """Return this instance's personality-driven UI settings (accent colour)."""
-    from app.agents.personality import get_accent_color
-    from app.config import BASE_DIR
-    return {"accent_color": get_accent_color(BASE_DIR)}
-
 
 @router.post("/restart")
 async def restart_server():

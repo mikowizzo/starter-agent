@@ -175,15 +175,3 @@ export async function fetchClones(): Promise<{
   }
 }
 
-// ── Identity (per-clone accent colour) ─────────────────────────────
-
-export async function fetchIdentity(): Promise<string | null> {
-  try {
-    const res = await fetch("/settings/identity");
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.accent_color ?? null;
-  } catch {
-    return null;
-  }
-}

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback } from "react";
-import { Loader2 } from "lucide-react";
+import { Loader2, ChevronDown } from "lucide-react";
 import { InputBar } from "./components/InputBar";
 import { BottomBar } from "./components/BottomBar";
 import { FileExplorer } from "./components/FileExplorer";
@@ -10,7 +10,7 @@ import {
   isActive,
 } from "./components/MessageBubble";
 import { useAgentStream } from "./hooks/useAgentStream";
-import { loadSessionHistory, fetchTeamId, fetchIdentity } from "./lib/api";
+import { loadSessionHistory, fetchTeamId } from "./lib/api";
 
 // ── Backend-ready gate ──────────────────────────────────────────────
 // Polls /health until the backend responds, then renders the app.
@@ -78,6 +78,7 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
   } = stream;
   const [filesOpen, setFilesOpen] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(true);
+  const [showScrollBtn, setShowScrollBtn] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
@@ -97,10 +98,6 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
     (async () => {
       try {
         await fetchTeamId();
-        const accent = await fetchIdentity();
-        if (accent) {
-          document.documentElement.style.setProperty("--color-accent", accent);
-        }
         if (!activeRun) {
           if (sessionId) setMessages(await loadSessionHistory(sessionId));
         }
@@ -191,18 +188,22 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <div className="mx-auto flex h-full w-full max-w-3xl flex-col px-5">
           {/* Messages */}
-          <div
-            ref={scrollRef}
-            onScroll={() => {
-              const el = scrollRef.current;
-              // Ignore our own programmatic scrolls — only a real user scroll
-              // (or its final resting state) may flip the near-bottom flag.
-              if (!el || autoScrollLockRef.current) return;
-              isNearBottomRef.current =
-                el.scrollHeight - el.scrollTop - el.clientHeight < 100;
-            }}
-            className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden overscroll-contain scrollbar-thin pr-1 pb-2"
-          >
+          <div className="relative flex min-h-0 flex-1 flex-col">
+            <div
+              ref={scrollRef}
+              onScroll={() => {
+                const el = scrollRef.current;
+                // Ignore our own programmatic scrolls — only a real user scroll
+                // (or its final resting state) may flip the near-bottom flag.
+                if (!el || autoScrollLockRef.current) return;
+                isNearBottomRef.current =
+                  el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+                setShowScrollBtn(
+                  el.scrollHeight - el.scrollTop - el.clientHeight > 200,
+                );
+              }}
+              className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain scrollbar-thin pr-1 pb-2"
+            >
             <div ref={contentRef} className="space-y-6">
               {loadingHistory && (
                 <div className="flex justify-center py-12">
@@ -225,6 +226,18 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
 
               {showThinking && <ThinkingDots />}
             </div>
+            </div>
+
+            {/* Scroll to bottom */}
+            {showScrollBtn && (
+              <button
+                onClick={() => scrollToBottom(true)}
+                className="absolute bottom-4 left-1/2 z-10 flex h-9 w-9 -translate-x-1/2 items-center justify-center rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-dim)] shadow-lg transition-colors hover:text-[var(--color-accent)]"
+                aria-label="Scroll to bottom"
+              >
+                <ChevronDown className="h-5 w-5" />
+              </button>
+            )}
           </div>
 
           {/* Input */}
