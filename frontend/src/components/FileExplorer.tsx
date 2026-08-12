@@ -488,18 +488,16 @@ export function FileExplorer({ open, onClose }: FileExplorerProps) {
                   {languageLabel(buffer.path)}
                 </span>
 
-                {/* Download button for binary files */}
-                {buffer.isBinary && (
-                  <a
-                    href={rawUrl(buffer.path) + "&download=true"}
-                    download
-                    className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-[var(--color-dim)] transition hover:text-[var(--color-accent)]"
-                    title="Download"
-                  >
-                    <Download className="h-3 w-3" />
-                    Download
-                  </a>
-                )}
+                {/* Download button */}
+                <a
+                  href={rawUrl(buffer.path) + "&download=true"}
+                  download
+                  className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-[var(--color-dim)] transition hover:text-[var(--color-accent)]"
+                  title="Download"
+                >
+                  <Download className="h-3 w-3" />
+                  Download
+                </a>
 
                 {/* Markdown preview toggle */}
                 {showMdToggle && (
