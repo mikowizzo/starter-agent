@@ -688,26 +688,58 @@ class CodeTools(Toolkit):
     def _shell_guard(self, command: str) -> str | None:
         """Return an error string if the command escapes the workspace, else None.
 
+        Uses shlex.split for proper shell tokenisation (handles quoting
+        correctly) then applies three checks:
+          1. Blocked commands (sudo, env, dd, mkfs, ...)
+          2. Home-dir escapes (~/, $HOME)
+          3. Path containment — resolve then is_relative_to
+
+        Interpreter code arguments (after python3 -c, node -e, etc.) are
+        exempted by position — they're code, not filesystem paths.
+
         ponytail: regex guardrail, not a sandbox — command substitution
         ($(cat /etc/passwd)) can dodge it. Real containment = run in a
         container/bwrap. Add that only if this leaks.
         """
         if self._env_access(command):
             return "❌ Shell: .env access is blocked."
-        for raw in re.findall(r"\S+", command):
-            tok = raw.strip("\"'")
+
+        # Proper shell tokenisation — fails closed on unbalanced quotes.
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            return ("❌ Shell: unparseable command "
+                    "(unbalanced quoting). Rewrite and retry.")
+
+        # Interpreters where the argument after -c / -e is code, not a path.
+        _CODE_FLAGS = {"-c", "-e"}
+        _INTERPRETERS = {"python", "python3", "node", "ruby", "perl"}
+
+        prev = None
+        for tok in tokens:
+            # Skip interpreter code arguments (python3 -c "...", node -e "...")
+            if prev in _INTERPRETERS and tok in _CODE_FLAGS:
+                prev = tok
+                continue
+            if prev in _CODE_FLAGS:
+                prev = tok
+                continue
+
             if tok in _SHELL_BLOCKED_CMDS or tok.startswith("mkfs"):
                 return f"❌ Shell: '{tok}' is blocked."
             if tok.startswith(("~", "$HOME", "${HOME}")):
                 return f"❌ Shell: path escapes workspace: {tok}"
-            # Check path-like tokens for workspace containment
-            if "/" in tok or tok.startswith("."):
-                try:
-                    resolved = (self.base / tok).resolve()
-                    if not resolved.is_relative_to(self.base):
-                        return f"❌ Shell: path outside workspace: {tok}"
-                except (ValueError, OSError):
-                    return f"❌ Shell: unresolvable path: {tok}"
+            # Check the token and any value after = (--flag=/abs/path)
+            # so long-flag form can't smuggle an absolute path.
+            for part in re.split(r"=", tok, maxsplit=1):
+                if "/" in part or part.startswith("."):
+                    try:
+                        resolved = (self.base / part).resolve()
+                        if not resolved.is_relative_to(self.base):
+                            return f"❌ Shell: path outside workspace: {tok}"
+                    except (ValueError, OSError):
+                        return f"❌ Shell: unresolvable path: {tok}"
+            prev = tok
         return None
 
     @staticmethod
@@ -735,6 +767,8 @@ class CodeTools(Toolkit):
           - .env access blocked (also env/printenv)
           - paths outside the workspace blocked (.., ~, $HOME, absolutes)
           - destructive/system commands blocked (sudo, su, dd, mkfs, ...)
+          - interpreter code args (python3 -c, node -e) exempt from path checks
+          - unparsable quoting fails closed (rewrite and retry)
 
         Args:
             command: Shell command to run.
