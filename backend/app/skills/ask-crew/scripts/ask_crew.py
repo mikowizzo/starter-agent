@@ -43,9 +43,11 @@ Reads SYNTHETIC_API_KEY (Kimi K3) and OPENROUTER_API_KEY
 """
 import concurrent.futures
 import hashlib
+import itertools
 import json
 import os
 import re
+import secrets
 import sqlite3
 import string
 import sys
@@ -142,7 +144,7 @@ HERETIC_SYSTEM_PROMPT = (
 # Elo/claims — those land as migrations when the features are built.
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -182,6 +184,44 @@ CREATE VIRTUAL TABLE IF NOT EXISTS runs_fts USING fts5(
 CREATE TRIGGER IF NOT EXISTS runs_ai AFTER INSERT ON runs BEGIN
     INSERT INTO runs_fts(rowid, query) VALUES (new.rowid, new.query);
 END;
+"""
+
+SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS matches (
+    match_id        TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    category        TEXT NOT NULL DEFAULT 'general',
+    response_id_a   INTEGER REFERENCES responses(response_id),
+    response_id_b   INTEGER REFERENCES responses(response_id),
+    model_a         TEXT NOT NULL,
+    model_b         TEXT NOT NULL,
+    judge_model     TEXT NOT NULL,
+    judge_recused   INTEGER NOT NULL DEFAULT 0,
+    presented_a_is  TEXT NOT NULL CHECK (presented_a_is IN ('model_a','model_b')),
+    verdict         TEXT NOT NULL CHECK (verdict IN ('A','B','tie')),
+    winner_model    TEXT,
+    score_model_a   REAL NOT NULL CHECK (score_model_a IN (0.0, 0.5, 1.0)),
+    confidence      INTEGER NOT NULL DEFAULT 3 CHECK (confidence BETWEEN 1 AND 5),
+    swap_consistent INTEGER,
+    judge_cost_usd  REAL NOT NULL DEFAULT 0,
+    judge_reason    TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_matches_run    ON matches(run_id);
+CREATE INDEX IF NOT EXISTS idx_matches_models ON matches(model_a, model_b);
+CREATE INDEX IF NOT EXISTS idx_matches_cat    ON matches(category);
+
+CREATE TABLE IF NOT EXISTS ratings (
+    model_id   TEXT NOT NULL,
+    category   TEXT NOT NULL DEFAULT '*',
+    rating     REAL NOT NULL DEFAULT 1500.0,
+    games      INTEGER NOT NULL DEFAULT 0,
+    wins       INTEGER NOT NULL DEFAULT 0,
+    losses     INTEGER NOT NULL DEFAULT 0,
+    ties       INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (model_id, category)
+);
 """
 
 SCHEMA_V2 = """
@@ -238,6 +278,8 @@ def _open_ledger(path: str | None = None) -> sqlite3.Connection:
         conn.executescript(SCHEMA_SQL)
     if version < 2:
         conn.executescript(SCHEMA_V2)
+    if version < 3:
+        conn.executescript(SCHEMA_V3)
     if version < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     return conn
@@ -701,18 +743,452 @@ def run_claim_cartography(
     display_claim_map(clusters, len(all_claims), len(ok_results))
 
 
-def parse_args(argv: list[str]) -> tuple[list[str], list[str], str, bool, int, bool]:
-    """Parse CLI into (models, files, query, history_flag, history_limit, no_claims).
+JUDGE_MODEL_ID = HERETIC_MODEL_ID  # Kimi K3: hardcoded default judge
+ELO_START = 1500.0
+ELO_SCALE = 400.0
 
-    --history [N]  shows recent runs from the ledger and exits.
-    --no-claims    skip claim cartography.
+ARENA_CATEGORIES = ('coding', 'reasoning', 'creative', 'math', 'general')
+
+_CATEGORY_HINTS = {
+    'coding':    r'\b(code|function|python|javascript|sql|regex|debug|refactor|compile|api|bug|class|import)\b',
+    'math':      r'\b(calculate|integral|derivative|probability|equation|solve|algebra|proof|theorem|\d+\s*[+\-*/]\s*\d+)\b',
+    'reasoning': r'\b(why|reason|logic|argue|infer|implies|paradox|assume|therefore|fallacy|deduce)\b',
+    'creative':  r'\b(story|poem|write a|imagine|fiction|haiku|screenplay|metaphor|brainstorm)\b',
+}
+
+
+def classify_category(question: str) -> str:
+    q = question.lower()
+    for cat, pat in _CATEGORY_HINTS.items():
+        if re.search(pat, q):
+            return cat
+    return 'general'
+
+
+def elo_k(games: int) -> float:
+    if games < 30:
+        return 32.0
+    if games < 100:
+        return 24.0
+    return 16.0
+
+
+def elo_expected(ra: float, rb: float) -> float:
+    return 1.0 / (1.0 + 10.0 ** ((rb - ra) / ELO_SCALE))
+
+
+def elo_update(ra, rb, score_a, games_a, games_b):
+    ea = elo_expected(ra, rb)
+    return (ra + elo_k(games_a) * (score_a - ea),
+            rb + elo_k(games_b) * ((1.0 - score_a) - (1.0 - ea)))
+
+
+def pick_judge(model_id_a: str, model_id_b: str):
+    """Kimi is the hardcoded judge. If Kimi is a defendant, the third crew
+    member — not in this pair — takes the bench. Returns (judge_cfg, recused)."""
+    for cfg in CREW:
+        if cfg[0] == JUDGE_MODEL_ID and cfg[0] not in (model_id_a, model_id_b):
+            return cfg, False
+    for cfg in CREW:
+        if cfg[0] not in (model_id_a, model_id_b):
+            return cfg, True
+    raise RuntimeError('No conflict-free judge available (crew < 3 models?)')
+
+
+_JUDGE_SYSTEM = (
+    "You are an impartial grading judge. You will see one question and two "
+    "anonymous answers (A and B). Rules:\n"
+    "- Score ONLY correctness, completeness, and clarity.\n"
+    "- Do NOT treat answer length, formatting, or confident tone as quality signals.\n"
+    "- Do NOT speculate about which system wrote which answer; if you suspect you "
+    "recognize an answer's style or authorship, disregard it entirely.\n"
+    "- If neither answer is meaningfully better, call a tie.\n"
+    "Return STRICT JSON, nothing else:\n"
+    '{"winner": "A"|"B"|"tie", "confidence": 1-5, "reason": "<=30 words"}'
+)
+
+
+def build_judge_prompt(question, text_a, text_b):
+    return (
+        f"QUESTION:\n{question}\n\n"
+        f"=== RESPONSE A ===\n{text_a}\n\n"
+        f"=== RESPONSE B ===\n{text_b}\n\n"
+        "Return the JSON verdict now."
+    )
+
+
+def parse_verdict(raw: str):
+    """Tolerant JSON extraction: strips code fences, finds first {...} block."""
+    m = re.search(r'\{[^{}]*\}', raw, re.S)
+    if not m:
+        return None
+    try:
+        v = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+    if v.get('winner') not in ('A', 'B', 'tie'):
+        return None
+    try:
+        conf = int(v.get('confidence', 3))
+    except (TypeError, ValueError):
+        conf = 3
+    return {
+        'winner': v['winner'],
+        'confidence': max(1, min(5, conf)),
+        'reason': str(v.get('reason', ''))[:200],
+    }
+
+
+def _judge_http_call(judge_cfg, prompt_text):
+    """Single chat call for judging. Returns (raw_text, cost_usd)."""
+    model_id, _label, base_url, key_env, p_in, p_out = judge_cfg
+    key = get_env_key(key_env)
+    if not key:
+        raise RuntimeError(f'{key_env} not set (needed for judge {model_id})')
+    body = json.dumps({
+        'model': model_id,
+        'messages': [
+            {'role': 'system', 'content': _JUDGE_SYSTEM},
+            {'role': 'user', 'content': prompt_text},
+        ],
+        'temperature': 0.0,
+        'max_tokens': 300,
+    }).encode()
+    last_err = None
+    for _ in range(3):
+        try:
+            url = base_url.rstrip('/') + '/chat/completions'
+            req = urllib.request.Request(
+                url,
+                data=body,
+                method='POST',
+                headers={
+                    'Authorization': f'Bearer {key}',
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'ask-crew-judge/1.0',
+                },
+            )
+            with urllib.request.urlopen(req, timeout=90) as r:
+                data = json.loads(r.read())
+            usage = data.get('usage') or {}
+            cost = (
+                usage.get('prompt_tokens', 0) / 1e6 * p_in
+                + usage.get('completion_tokens', 0) / 1e6 * p_out
+            )
+            content = (data.get('choices') or [{}])[0].get('message', {}).get('content', '')
+            return content, cost
+        except Exception as e:
+            last_err = e
+            time.sleep(2)
+    raise RuntimeError(f'judge call failed: {last_err}')
+
+
+def judge_pair(question, resp_a, resp_b, do_swap):
+    """Judge one pair. resp_a/resp_b: dicts with model_id, answer_text,
+    response_id. Returns match dict or None if unjudgeable."""
+    judge_cfg, recused = pick_judge(resp_a['model_id'], resp_b['model_id'])
+    total_cost = 0.0
+
+    # Cryptographic coin-flip for seat assignment
+    presented_a_is = 'model_a' if secrets.randbelow(2) == 0 else 'model_b'
+    shown_a, shown_b = (
+        (resp_a, resp_b) if presented_a_is == 'model_a'
+        else (resp_b, resp_a)
+    )
+
+    def one_pass(ta, tb):
+        raw, cost = _judge_http_call(
+            judge_cfg, build_judge_prompt(question, ta, tb)
+        )
+        return raw, parse_verdict(raw), cost
+
+    raw1, v1, c1 = one_pass(shown_a['answer_text'], shown_b['answer_text'])
+    total_cost += c1
+    swap_consistent = None
+    if v1 is None:
+        return None  # judge gave garbage; skip pair
+
+    if do_swap:
+        raw2, v2, c2 = one_pass(shown_b['answer_text'], shown_a['answer_text'])
+        total_cost += c2
+        remap = {'A': 'B', 'B': 'A', 'tie': 'tie'}
+        if v2 is not None:
+            swap_consistent = 1 if remap[v2['winner']] == v1['winner'] else 0
+            if not swap_consistent:
+                # Position bias detected — force tie
+                v1 = {'winner': 'tie', 'confidence': v1['confidence'],
+                      'reason': f'position-inconsistent: {v1["reason"]}'}
+
+    # Low-confidence verdicts don't move ratings
+    effective = v1 if v1['confidence'] > 1 else {**v1, 'winner': 'tie'}
+
+    # Resolve judge seats back to real models
+    winner_model = None
+    if effective['winner'] == 'A':
+        winner_model = shown_a['model_id']
+    elif effective['winner'] == 'B':
+        winner_model = shown_b['model_id']
+
+    if winner_model == resp_a['model_id']:
+        score_a = 1.0
+    elif winner_model == resp_b['model_id']:
+        score_a = 0.0
+    else:
+        score_a = 0.5
+
+    return {
+        'match_id': str(uuid.uuid4()),
+        'response_id_a': resp_a.get('response_id'),
+        'response_id_b': resp_b.get('response_id'),
+        'model_a': resp_a['model_id'],
+        'model_b': resp_b['model_id'],
+        'judge_model': judge_cfg[0],
+        'judge_recused': int(recused),
+        'presented_a_is': presented_a_is,
+        'verdict': effective['winner'],
+        'winner_model': winner_model,
+        'score_model_a': score_a,
+        'confidence': v1['confidence'],
+        'swap_consistent': swap_consistent,
+        'judge_cost_usd': round(total_cost, 6),
+        'judge_reason': effective['reason'],
+    }
+
+
+def _rating_row(conn, model_id, category):
+    row = conn.execute(
+        'SELECT rating, games FROM ratings WHERE model_id=? AND category=?',
+        (model_id, category),
+    ).fetchone()
+    return (row[0], row[1]) if row else (ELO_START, 0)
+
+
+def _bump_rating(conn, model_id, category, new_rating, score):
+    w = 1 if score == 1.0 else 0
+    l = 1 if score == 0.0 else 0
+    t = 1 if score == 0.5 else 0
+    conn.execute(
+        "INSERT INTO ratings (model_id, category, rating, games, wins, "
+        "losses, ties, updated_at) "
+        "VALUES (?,?,?,1,?,?,?,datetime('now')) "
+        "ON CONFLICT(model_id, category) DO UPDATE SET "
+        "rating=excluded.rating, games=games+1, "
+        "wins=wins+excluded.wins, losses=losses+excluded.losses, "
+        "ties=ties+excluded.ties, updated_at=excluded.updated_at",
+        (model_id, category, new_rating, w, l, t),
+    )
+
+
+def apply_match_to_ratings(conn, m):
+    """Update global '*' and per-category rows for both players."""
+    for cat in ('*', m['category']):
+        ra, ga = _rating_row(conn, m['model_a'], cat)
+        rb, gb = _rating_row(conn, m['model_b'], cat)
+        nra, nrb = elo_update(ra, rb, m['score_model_a'], ga, gb)
+        _bump_rating(conn, m['model_a'], cat, nra, m['score_model_a'])
+        _bump_rating(conn, m['model_b'], cat, nrb, 1.0 - m['score_model_a'])
+
+
+def recompute_ratings(conn):
+    """Full deterministic replay from match history."""
+    conn.execute('DELETE FROM ratings')
+    rows = conn.execute(
+        "SELECT match_id, category, model_a, model_b, score_model_a "
+        "FROM matches ORDER BY created_at, match_id"
+    ).fetchall()
+    for r in rows:
+        m = {
+            'category': r[0 + 1],  # category
+            'model_a': r[0 + 2],
+            'model_b': r[0 + 3],
+            'score_model_a': r[0 + 4],
+        }
+        apply_match_to_ratings(conn, m)
+    conn.commit()
+
+
+def run_arena(conn, run_id, question, responses, do_swap):
+    """Full round-robin over crew responses. responses: list of dicts with
+    response_id, model_id, answer_text, error. Heretic excluded by caller."""
+    eligible = [r for r in responses
+                if r.get('answer_text') and not r.get('error')]
+    if len(eligible) < 2:
+        print('Arena: fewer than 2 successful answers — skipped.')
+        return []
+    category = classify_category(question)
+    pairs = [(a, b) for a, b in itertools.combinations(eligible, 2)]
+    matches, total_cost = [], 0.0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futs = {ex.submit(judge_pair, question, a, b, do_swap): (a, b)
+                for a, b in pairs}
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                m = fut.result()
+            except Exception as e:
+                a, b = futs[fut]
+                print(f'Arena: judge failed for {a["model_id"]} vs '
+                      f'{b["model_id"]}: {e} — pair skipped.')
+                continue
+            if m:
+                m['run_id'] = run_id
+                m['category'] = category
+                matches.append(m)
+                total_cost += m['judge_cost_usd']
+
+    # Deterministic application order so replay == live
+    matches.sort(key=lambda m: (m['model_a'], m['model_b']))
+    for m in matches:
+        conn.execute(
+            "INSERT INTO matches (match_id, run_id, category, response_id_a, "
+            "response_id_b, model_a, model_b, judge_model, judge_recused, "
+            "presented_a_is, verdict, winner_model, score_model_a, "
+            "confidence, swap_consistent, judge_cost_usd, judge_reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (m['match_id'], m['run_id'], m['category'],
+             m['response_id_a'], m['response_id_b'],
+             m['model_a'], m['model_b'], m['judge_model'],
+             m['judge_recused'], m['presented_a_is'], m['verdict'],
+             m['winner_model'], m['score_model_a'], m['confidence'],
+             m['swap_consistent'], m['judge_cost_usd'], m['judge_reason']),
+        )
+        apply_match_to_ratings(conn, m)
+    conn.commit()
+
+    print(f'\n{"=" * 70}')
+    print(f'Arena [{category}] — {len(matches)} matches judged')
+    print('=' * 70)
+    labels = {e[0]: e[1] for e in CREW}
+    for m in matches:
+        res = ('tie' if m['winner_model'] is None
+               else f'{labels.get(m["winner_model"], m["winner_model"])} wins')
+        rec = ' (recused)' if m['judge_recused'] else ''
+        sw = {None: '', 1: ' +swap-ok', 0: ' +swap-bias->tie'}[m['swap_consistent']]
+        judge_lbl = labels.get(m['judge_model'], m['judge_model'])
+        print(f'  {labels.get(m["model_a"], m["model_a"])[:15]} vs '
+              f'{labels.get(m["model_b"], m["model_b"])[:15]}: {res}'
+              f' [judge: {judge_lbl[:15]}{rec}, conf {m["confidence"]}{sw}]')
+        if m['judge_reason']:
+            print(f'    {m["judge_reason"]}')
+    print(f'  judge cost: ${total_cost:.4f}')
+    return matches
+
+
+def show_leaderboard(conn, category='*'):
+    rows = conn.execute(
+        "SELECT model_id, rating, games, wins, losses, ties FROM ratings "
+        "WHERE category=? ORDER BY rating DESC",
+        (category,),
+    ).fetchall()
+    tag = 'GLOBAL' if category == '*' else category.upper()
+    print(f'\n{"=" * 70}')
+    print(f'🏆 ELO LEADERBOARD [{tag}]')
+    print('=' * 70)
+    if not rows:
+        print('  No rated matches yet. Run with --judge first.')
+        print()
+        return
+    print(f'  {"#":<3}{"model":<36}{"rating":>8}{"games":>7}{"W-L-T":>12}')
+    print(f'  {"-" * 66}')
+    labels = {e[0]: e[1] for e in CREW}
+    for i, r in enumerate(rows, 1):
+        mid, rating, games, w, l, t = r
+        lbl = labels.get(mid, mid)
+        prov = ' (prov)' if games < 30 else ''
+        print(f'  {i:<3}{lbl:<36}{rating:>8.1f}{games:>7}'
+              f'{f"{w}-{l}-{t}":>12}{prov}')
+
+    # Judge accountability footnote
+    stats = conn.execute(
+        "SELECT judge_model, COUNT(*), "
+        "AVG(CASE WHEN swap_consistent=0 THEN 1.0 ELSE 0.0 END) "
+        "FROM matches GROUP BY judge_model"
+    ).fetchall()
+    if stats:
+        print(f'\n  {"Judge accountability":<36}{"matches":>8}{"flip-rate":>12}')
+        for jm, n, flip in stats:
+            jlbl = labels.get(jm, jm)
+            fr = f'{flip:.0%}' if flip is not None else 'n/a'
+            print(f'  {jlbl:<36}{n:>8}{fr:>12}')
+    print()
+
+
+def audit_judge_bias(conn):
+    """Empirical self-preference check using stored verdicts."""
+    rows = conn.execute(
+        "SELECT judge_model, judge_recused, verdict, "
+        "COUNT(*) as cnt FROM matches GROUP BY judge_model, judge_recused, verdict"
+    ).fetchall()
+    if not rows:
+        print('\n  No matches yet — nothing to audit.\n')
+        return
+    labels = {e[0]: e[1] for e in CREW}
+    print(f'\n{"=" * 70}')
+    print('🔍 JUDGE BIAS AUDIT')
+    print('=' * 70)
+    for jm, recused, verdict, cnt in rows:
+        jlbl = labels.get(jm, jm)
+        tag = ' (recused/substitute)' if recused else ''
+        print(f'  {jlbl}{tag}: {verdict} x{cnt}')
+    print()
+
+
+def print_blind(responses):
+    """Anonymized crew output shown before judging."""
+    labels_list = list(string.ascii_uppercase)
+    mapping = {}
+    for i, r in enumerate(responses):
+        seat = labels_list[i]
+        mapping[r['model_id']] = seat
+        print(f'\n{"=" * 70}')
+        print(f'BLIND ARENA — Model {seat} (identity hidden)')
+        print('=' * 70)
+        print(r.get('answer_text') or f'[error: {r.get("error")}]')
+        print()
+    return mapping
+
+
+def print_reveal(mapping):
+    print(f'\n{"=" * 70}')
+    print('REVEAL')
+    print('=' * 70)
+    for model_id, seat in sorted(mapping.items(), key=lambda x: x[1]):
+        labels = {e[0]: e[1] for e in CREW}
+        lbl = labels.get(model_id, model_id)
+        print(f'  Model {seat} = {lbl}')
+    print()
+
+
+
+def parse_args(argv: list[str]) -> dict:
+    """Parse CLI into a dict of options.
+
+    Flags:
+      --models ID,ID      restrict to specific crew models
+      --file PATH         inline a file into the prompt (repeatable)
+      --history [N]       show recent runs and exit
+      --no-claims         skip claim cartography
+      --judge             run blind arena after crew answers (adds judge calls)
+      --judge-swap        double-judge each pair to catch position bias
+      --elo [CAT]         print Elo leaderboard and exit
+      --elo-rebuild       replay match history to rebuild ratings, then exit
+      --audit-bias        print judge bias audit and exit
     """
-    models: list[str] = [e[0] for e in CREW]
-    files: list[str] = []
+    opts = {
+        "models": [e[0] for e in CREW],
+        "files": [],
+        "query": "",
+        "history": False,
+        "history_limit": 10,
+        "no_claims": False,
+        "judge": False,
+        "judge_swap": False,
+        "elo": False,
+        "elo_category": "*",
+        "elo_rebuild": False,
+        "audit_bias": False,
+    }
     rest: list[str] = []
-    history = False
-    history_limit = 10
-    no_claims = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -720,30 +1196,49 @@ def parse_args(argv: list[str]) -> tuple[list[str], list[str], str, bool, int, b
             if i + 1 >= len(argv):
                 print("ERROR: --models needs a comma-separated list", file=sys.stderr)
                 sys.exit(2)
-            models = [m.strip() for m in argv[i + 1].split(",") if m.strip()]
+            opts["models"] = [m.strip() for m in argv[i + 1].split(",") if m.strip()]
             i += 2
         elif a == "--file":
             if i + 1 >= len(argv):
                 print("ERROR: --file needs a PATH", file=sys.stderr)
                 sys.exit(2)
-            files.append(argv[i + 1])
+            opts["files"].append(argv[i + 1])
             i += 2
         elif a == "--history":
-            history = True
-            # Optional numeric arg: --history 20
+            opts["history"] = True
             if i + 1 < len(argv) and argv[i + 1].isdigit():
-                history_limit = int(argv[i + 1])
+                opts["history_limit"] = int(argv[i + 1])
                 i += 2
             else:
                 i += 1
         elif a == "--no-claims":
-            no_claims = True
+            opts["no_claims"] = True
+            i += 1
+        elif a == "--judge":
+            opts["judge"] = True
+            i += 1
+        elif a == "--judge-swap":
+            opts["judge_swap"] = True
+            opts["judge"] = True  # swap implies judge
+            i += 1
+        elif a == "--elo":
+            opts["elo"] = True
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                opts["elo_category"] = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+        elif a == "--elo-rebuild":
+            opts["elo_rebuild"] = True
+            i += 1
+        elif a == "--audit-bias":
+            opts["audit_bias"] = True
             i += 1
         else:
             rest.append(a)
             i += 1
-    query = " ".join(rest).strip()
-    return models, files, query, history, history_limit, no_claims
+    opts["query"] = " ".join(rest).strip()
+    return opts
 
 
 def _cost(entry: tuple | None, usage: dict) -> float:
@@ -757,11 +1252,32 @@ def _cost(entry: tuple | None, usage: dict) -> float:
 
 
 def main() -> int:
-    models, files, query, history, history_limit, no_claims = parse_args(sys.argv[1:])
+    opts = parse_args(sys.argv[1:])
 
     # --history: read-only ledger view, then exit
-    if history:
-        return cmd_history(history_limit)
+    if opts["history"]:
+        return cmd_history(opts["history_limit"])
+
+    # --elo / --elo-rebuild / --audit-bias: read-only ledger views, then exit
+    if opts["elo_rebuild"] or opts["elo"] or opts["audit_bias"]:
+        try:
+            conn = _open_ledger()
+        except Exception as e:
+            print(f"[ledger] ERROR: cannot open ledger ({e})", file=sys.stderr)
+            return 1
+        if opts["elo_rebuild"]:
+            recompute_ratings(conn)
+            show_leaderboard(conn, opts["elo_category"])
+        elif opts["audit_bias"]:
+            audit_judge_bias(conn)
+        else:
+            show_leaderboard(conn, opts["elo_category"])
+        conn.close()
+        return 0
+
+    query = opts["query"]
+    files = opts["files"]
+    models = opts["models"]
 
     if not query and not files:
         print(__doc__)
@@ -886,7 +1402,7 @@ def main() -> int:
     # Claim Cartography: local, deterministic, zero extra model calls.
     # Fires after ledger write so response_ids are available. Silently
     # skips if models didn't follow the CLAIMS/DISSENT format.
-    if not no_claims and run_id:
+    if not opts["no_claims"] and run_id:
         # Enrich results with response_ids from the ledger for claim storage
         try:
             conn = _open_ledger()
@@ -910,6 +1426,28 @@ def main() -> int:
         crew_count = sum(1 for r in ok_results if r.get("role") == "council")
         if len(ok_results) >= 2:
             run_claim_cartography(ok_results, run_id, crew_count)
+
+    # Blind Arena + Elo: optional, flag-gated. Fires after all other features.
+    # Uses the same response_ids enriched above for FK integrity.
+    if opts["judge"] and run_id:
+        # Build arena responses (council only — heretic excluded)
+        arena_responses = [
+            {
+                "response_id": r.get("response_id"),
+                "model_id": r["model_id"],
+                "answer_text": r["text"],
+                "error": r.get("error"),
+            }
+            for r in ledger_responses
+            if r.get("role") == "council"
+        ]
+        try:
+            conn = _open_ledger()
+            run_arena(conn, run_id, query, arena_responses, opts["judge_swap"])
+            show_leaderboard(conn)
+            conn.close()
+        except Exception as e:
+            print(f"[arena] WARNING: arena failed: {e}", file=sys.stderr)
 
     return 0
 
