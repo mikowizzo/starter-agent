@@ -2,18 +2,18 @@
 name: ask-crew
 description: >
   Fire one query at multiple MODELS in parallel (Kimi K3 via Synthetic,
-  DeepSeek V4 Pro 0813, Grok 4.6, Gemini 3.7 Flash) and print each answer.
+  Grok 4.6, Gemini 3.7 Flash) and print each answer.
   Use to compare how different MODELS answer the same question.
   IMPORTANT: this queries AI MODELS via the Synthetic/OpenRouter APIs
   — NOT the clone crew members (franky, nami, etc.). Do NOT use the
   talk_to tool for this. Reads SYNTHETIC_API_KEY for Kimi K3,
-  OPENROUTER_API_KEY for DeepSeek V4 Pro 0813, Grok 4.6, and Gemini 3.7 Flash.
+  OPENROUTER_API_KEY for Grok 4.6 and Gemini 3.7 Flash.
 license: MIT
 ---
 
 # Ask Crew
-Asks the "model crew" — four MODELS (Kimi K3 via Synthetic,
-DeepSeek V4 Pro 0813, Grok 4.6, Gemini 3.7 Flash) answer the same query in
+Asks the "model crew" — three MODELS (Kimi K3 via Synthetic,
+Grok 4.6, Gemini 3.7 Flash) answer the same query in
 parallel and their answers are printed side by side. Each has a bespoke
 route: Kimi K3 (Synthetic), the rest via OpenRouter.
 
@@ -29,7 +29,7 @@ Preferred — invoke through the skill access tools (never shell):
 Legacy shell usage (kept for reference, not recommended):
 
     python backend/app/skills/ask-crew/scripts/ask_crew.py "What's the best way to..."
-    python backend/app/skills/ask-crew/scripts/ask_crew.py --models x-ai/grok-4.6,deepseek/deepseek-v4-pro-0813 "..."
+    python backend/app/skills/ask-crew/scripts/ask_crew.py --models x-ai/grok-4.6,google/gemini-3.7-flash "..."
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file path/to/code.py "review this"
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file a.py --file b.py "compare these"
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file README.md   # defaults to "please review"
@@ -43,11 +43,10 @@ can never silently route to the wrong API.
 | Model | `--models` id | Route |
 |---|---|---|
 | Kimi K3 | `hf:moonshotai/Kimi-K3` | Synthetic (`SYNTHETIC_API_KEY`) |
-| DeepSeek V4 Pro 0813 | `deepseek/deepseek-v4-pro-0813` | OpenRouter (`OPENROUTER_API_KEY`) |
 | Grok 4.6 | `x-ai/grok-4.6` | OpenRouter (`OPENROUTER_API_KEY`) |
 | Gemini 3.7 Flash | `google/gemini-3.7-flash` | OpenRouter (`OPENROUTER_API_KEY`) |
 
-Default (no `--models`): all four.
+Default (no `--models`): all three.
 
 ## Files
 
