@@ -35,16 +35,21 @@ from pathlib import Path
 BASE_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 KEY_ENV = "OPENCODE_API_KEY"
 
-# The model crew: (model id, display label, [base_url, api_key_env]).
-# Two-tuples route via OpenCode (BASE_URL + OPENCODE_API_KEY); four-tuples
-# override the route — e.g. Kimi K3 goes through the Synthetic API instead.
+# The model crew: (model id, display label, [base_url, api_key_env],
+#   input_price_per_1m, output_price_per_1m).
+# Two-tuples (id, label) route via OpenCode (BASE_URL + OPENCODE_API_KEY) at
+# $0 pricing; six-tuples override the route and pricing — e.g. Kimi K3 goes
+# through the Synthetic API instead.
 CREW = [
     ("hf:moonshotai/Kimi-K3", "Kimi K3 (Synthetic)",
-     "https://api.synthetic.new/v1", "SYNTHETIC_API_KEY"),
+     "https://api.synthetic.new/v1", "SYNTHETIC_API_KEY",
+     2.80, 14.00),
     ("x-ai/grok-4.6", "Grok 4.6 (OpenRouter)",
-     "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+     "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
+     2.00, 6.00),
     ("google/gemini-3.7-flash", "Gemini 3.7 Flash (OpenRouter)",
-     "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+     "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
+     0.75, 3.75),
 ]
 
 
@@ -152,8 +157,12 @@ def build_prompt(query: str, files: list[str]) -> str:
     return query
 
 
-def ask(model_id: str, query: str, base_url: str, key: str) -> tuple[str, str, float]:
-    """Ask one model, return (model_id, content_or_error, elapsed_seconds)."""
+def ask(model_id: str, query: str, base_url: str, key: str) -> tuple[str, str, float, dict]:
+    """Ask one model, return (model_id, content_or_error, elapsed_seconds, usage).
+
+    ``usage`` is {"prompt_tokens": int, "completion_tokens": int} extracted
+    from the response's ``usage`` block (defaults to zeros on error/missing).
+    """
     body = json.dumps(
         {"model": model_id, "messages": [{"role": "user", "content": query}]}
     ).encode()
@@ -170,9 +179,14 @@ def ask(model_id: str, query: str, base_url: str, key: str) -> tuple[str, str, f
         content = (
             (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         )
-        return model_id, content.strip() or "(empty reply)", time.monotonic() - t0
+        usage_raw = data.get("usage") or {}
+        usage = {
+            "prompt_tokens": usage_raw.get("prompt_tokens", 0),
+            "completion_tokens": usage_raw.get("completion_tokens", 0),
+        }
+        return model_id, content.strip() or "(empty reply)", time.monotonic() - t0, usage
     except Exception as e:
-        return model_id, f"ERROR: {type(e).__name__}: {e}", time.monotonic() - t0
+        return model_id, f"ERROR: {type(e).__name__}: {e}", time.monotonic() - t0, {"prompt_tokens": 0, "completion_tokens": 0}
 
 
 def parse_args(argv: list[str]) -> tuple[list[str], list[str], str]:
@@ -236,11 +250,21 @@ def main() -> int:
         results = [f.result() for f in futures]
 
     order = {e[0][0]: i for i, e in enumerate(jobs)}
-    for mid, content, dt in sorted(results, key=lambda r: order[r[0]]):
-        label = next((e[1] for e in CREW if e[0] == mid), mid)
-        print(f"── {label} ({mid}) — {dt:.1f}s ──")
+    total_cost = 0.0
+    for mid, content, dt, usage in sorted(results, key=lambda r: order[r[0]]):
+        entry = next((e for e in CREW if e[0] == mid), None)
+        label = entry[1] if entry else mid
+        in_tok = usage["prompt_tokens"]
+        out_tok = usage["completion_tokens"]
+        # Calculate cost from token counts + per-model pricing (per 1M tokens)
+        in_price = entry[4] if entry and len(entry) >= 6 else 0.0
+        out_price = entry[5] if entry and len(entry) >= 6 else 0.0
+        cost = in_tok * in_price / 1_000_000 + out_tok * out_price / 1_000_000
+        total_cost += cost
+        print(f"── {label} ({mid}) — {dt:.1f}s · {in_tok:,}→{out_tok:,} tok · ${cost:.4f} ──")
         print(content)
         print()
+    print(f"💰 Total crew cost: ${total_cost:.4f}")
     return 0
 
 
