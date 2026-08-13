@@ -117,29 +117,34 @@ export function CodeEditor({ path, content, readOnly, onChange, onSave, markdown
       {/* ── Mobile accessory toolbar ─────────────────────────────── */}
       {/* Tab key, brackets, and other characters missing from virtual
           keyboards. Also provides a visible Save button since there's
-          no Cmd/Ctrl+S on touch devices. */}
+          no Cmd/Ctrl+S on touch devices. The char buttons scroll
+          horizontally; the Save button is pinned on the right so it's
+          always visible without scrolling. */}
       {!readOnly && (
-        <div className="flex gap-1 overflow-x-auto border-t border-[var(--color-border)] bg-[var(--color-panel)] px-2 py-1 md:hidden">
-          {["Tab", "(", ")", "{", "}", "[", "]", "=", ";", ":", "/", "<", ">", '"', "'"].map(
-            (k) => (
-              <button
-                key={k}
-                type="button"
-                className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded font-mono text-sm text-[var(--color-text)] transition active:scale-95 active:bg-[var(--color-border)]"
-                onPointerDown={(e) => e.preventDefault()}
-                onClick={() => insertAtCursor(k === "Tab" ? "  " : k)}
-              >
-                {k}
-              </button>
-            ),
-          )}
+        <div className="flex items-stretch border-t border-[var(--color-border)] bg-[var(--color-panel)] md:hidden">
+          <div className="flex gap-1 overflow-x-auto px-2 py-1 scrollbar-thin">
+            {["Tab", "(", ")", "{", "}", "[", "]", "=", ";", ":", "/", "<", ">", '"', "'"].map(
+              (k) => (
+                <button
+                  key={k}
+                  type="button"
+                  className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded font-mono text-sm text-[var(--color-text)] transition active:scale-95 active:bg-[var(--color-border)]"
+                  onPointerDown={(e) => e.preventDefault()}
+                  onClick={() => insertAtCursor(k === "Tab" ? "  " : k)}
+                >
+                  {k}
+                </button>
+              ),
+            )}
+          </div>
+          {/* Save — always pinned, never scrolled out of view */}
           <button
             type="button"
-            className="flex min-h-[44px] shrink-0 items-center justify-center gap-1.5 rounded px-4 font-medium text-sm text-[var(--color-text)] transition active:scale-95 active:bg-[var(--color-border)]"
+            className="flex min-h-[44px] shrink-0 items-center justify-center gap-1.5 border-l border-[var(--color-border)] bg-[var(--color-accent)] px-5 font-medium text-sm text-white transition active:scale-95"
             onPointerDown={(e) => e.preventDefault()}
             onClick={onSave}
             disabled={!isDirty}
-            style={{ opacity: isDirty ? 1 : 0.3 }}
+            style={{ opacity: isDirty ? 1 : 0.4 }}
           >
             Save
           </button>

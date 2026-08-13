@@ -42,6 +42,12 @@ else
     echo "[entrypoint] requirements.txt unchanged, skipping pip sync"
 fi
 
+# Point Playwright at the shared browser dir. The Dockerfile bakes this in
+# via ENV for new images; exporting it here keeps stale containers (built
+# before that change) working after a restart too. Browsers live at
+# /opt/pw-browsers so the non-root appuser can read them.
+export PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH:-/opt/pw-browsers}
+
 # Ensure .clones directory is writable by appuser (for clone_tools registry).
 mkdir -p /workspace/.clones
 chown 1000:1000 /workspace/.clones 2>/dev/null || true

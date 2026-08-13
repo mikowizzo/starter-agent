@@ -31,6 +31,16 @@ COPY --chown=appuser:appuser backend/requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r requirements.txt
 
+# Install Chromium browser binary for Playwright headless rendering.
+# --with-deps pulls in OS-level shared libraries (libnss, libatk, etc.).
+# Browsers go to /opt/pw-browsers (PLAYWRIGHT_BROWSERS_PATH) instead of
+# /root/.cache: /root is mode 0700, so the non-root appuser would not be
+# able to reach them at runtime — this bit us (browser launch worked in
+# root-shell tests but failed in the app). Chown so appuser can read.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+RUN playwright install --with-deps chromium \
+    && chown -R appuser:appuser /opt/pw-browsers
+
 # Copy the full codebase — both backend and frontend — so the agent can
 # read/edit frontend files even when bind mounts are stripped (DinD clones).
 COPY --chown=appuser:appuser backend/ ./

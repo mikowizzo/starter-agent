@@ -206,6 +206,30 @@ artifact + entity + pattern claims (`headquartered_in`, `subsidiary_of`,
 `founded_by`), evidence `inferred` with confidence 0.6 — wiki prose is a
 first-pass map, never a conclusion.
 
+## Transform library
+
+Beyond `transform-wiki`, the skill ships these transforms:
+
+### SEC & regulatory (Nami)
+
+| Transform | Purpose |
+|---|---|
+| `transform-sec` | SEC EDGAR: CIK lookup, filings (10-K/10-Q/8-K/…), XBRL companyfacts (revenue, net income, assets, equity, cash, debt). Evidence `direct`, conf 0.95. |
+| `transform-sec-form4` | Form 4 insider transactions: transaction codes (P/S/A/M), person entities, relationship claims, cluster detection (3+ insiders / 30 days → bullish/bearish signal). |
+| `transform-8k-events` | 8-K material event extraction by item code: `changed_executive`, `changed_auditor`, `disclosed_cyber_incident`, `completed_acquisition`, `reported_earnings`. |
+| `transform-risk-diff` | 10-K/10-Q risk factor diffs: `added_risk_factor`, `removed_risk_factor`, `intensified_risk_language`. |
+| `transform-forensic-facts` | PURE INGEST: SEC submissions + XBRL facts → raw forensic fact claims (no scoring). |
+| `analytics_forensic_score` | Pipes from `transform-forensic-facts`: deterministic versioned 0–100 forensic risk score. |
+| `forensic_analytics` | Versioned forensic scoring over graph facts from NDJSON stdin. |
+
+### Market pricing & fundamentals (Robin)
+
+| Transform | Purpose |
+|---|---|
+| `market_pricing` | OHLCV (yfinance, Stooq fallback) + RSI, ATR, vol, Bollinger %b, z-scores, max drawdown. Decision signals: tug_of_war, shelf_dwell, amihud_gradient, wick_asymmetry. `--anchor` support, 24h cache. |
+| `market_fundamentals` | yfinance fundamentals with graceful degradation: PE/PEG/PB/EV-EBITDA, growth, margins, ROE/ROA, D/E, OCF/FCF, analyst estimates, earnings surprises. |
+| `chart_svg` | Dependency-free SVG price charts with interactive hover. Used by `market_pricing`. |
+
 ## Identity and resolution
 
 - Identity is a union-find fold over merge/unmerge events. **Registry-keyed

@@ -14,6 +14,7 @@ from pathlib import Path
 from agno.tools import Toolkit
 
 from app.db import db
+from app.services.file_convert import convert_to_text, IMAGE_EXTS, MARKITDOWN_EXTS
 
 _READ_MAX_LINES = 2000
 
@@ -61,10 +62,36 @@ class AttachmentTools(Toolkit):
                 f"❌ Raw file missing for {row['filename']} ({attachment_id}): "
                 f"{path}. Status was {row['status']}."
             )
+        # Detect binary the same way code_tools.read does: strict UTF-8
+        # decode (raises on binary), then NUL-byte sniff.  The old code
+        # used errors="replace" which silently swallowed binary bytes and
+        # then only checked the first 8K for replacement chars — PDFs and
+        # DOCX files with ASCII-friendly headers slipped through.
+        converted = False
+        suffix = path.suffix.lower()
+        convertible = suffix in (MARKITDOWN_EXTS | IMAGE_EXTS)
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            if not convertible:
+                return f"❌ Cannot decode {row['filename']} as UTF-8 (binary file?)"
+            conv_text, _method = convert_to_text(path)
+            if conv_text is None:
+                return f"❌ Failed to convert {row['filename']} ({attachment_id})"
+            text = conv_text
+            converted = True
         except OSError as e:
             return f"❌ Cannot read {path}: {e}"
+
+        # NUL byte check — file decoded as UTF-8 but is still likely binary
+        if not converted and "\x00" in text[:8192]:
+            if not convertible:
+                return f"❌ Binary file (NUL byte detected): {row['filename']}"
+            conv_text, _method = convert_to_text(path)
+            if conv_text is None:
+                return f"❌ Binary file (NUL byte detected), conversion failed: {row['filename']}"
+            text = conv_text
+            converted = True
 
         lines = text.splitlines()
         total = len(lines)
@@ -83,7 +110,13 @@ class AttachmentTools(Toolkit):
         ]
         out = (
             f"[lines {offset + 1}–{end} of {total} in {row['filename']} "
-            f"(id={attachment_id}, status={row['status']})]\n"
+            f"(id={attachment_id}, status={row['status']})"
+            + (
+                "  ⟶ converted from binary by markitdown" if converted and suffix in MARKITDOWN_EXTS
+                else "  ⟶ described by vision model" if converted and suffix in IMAGE_EXTS
+                else ""
+            )
+            + "]\n"
             + "\n".join(numbered)
         )
         if end < total:

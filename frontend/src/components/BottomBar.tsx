@@ -205,6 +205,9 @@ const CLONE_COLORS: Record<string, string> = {
   robin: "text-purple-400",
   usopp: "text-yellow-400",
   franky: "text-cyan-400",
+  bella: "text-red-400",
+  scm: "text-teal-400",
+  hollard: "text-purple-400",
 };
 
 function InstanceLink({

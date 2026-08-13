@@ -19,8 +19,6 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 
-import requests
-
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
@@ -34,18 +32,9 @@ MAX_BYTES = 50 * 1024 * 1024          # 50 MB hard cap (matches /convert)
 MAX_STORED_CHARS = 500_000            # cap extracted text we persist
 CONVERT_TIMEOUT_S = 120               # markitdown can hang on malformed files
 
-# ── Vision extraction for images ─────────────────────────────────────
-# markitdown can't OCR photos, so images are described by a vision model
-# (MiniMax M3 via OpenCode). Documents keep going through markitdown.
-VISION_MODEL = "minimax-m3"
-VISION_ENDPOINT = "https://opencode.ai/zen/go/v1/chat/completions"
-VISION_MAX_EDGE = 1280                # downscale long edge to keep payload sane
-VISION_QUALITY = 85                   # JPEG re-encode quality
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif"}
-VISION_PROMPT = (
-    "Describe this image in detail, factually. Include any visible text, signs, "
-    "people, vehicles, buildings, property features, or landmarks. Be concise."
-)
+# ── Text extraction (delegates to shared file_convert service) ───────
+from app.services.file_convert import describe_image as _describe_image
+from app.services.file_convert import IMAGE_EXTS
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -95,44 +84,7 @@ def _is_image(mime_type: str | None, filename: str) -> bool:
     return Path(filename or "").suffix.lower() in IMAGE_EXTS
 
 
-def _describe_image(path: Path) -> str:
-    """Ask the vision model (MiniMax M3 via OpenCode) what's in the photo."""
-    import base64
-    import io
-
-    from PIL import Image
-
-    img = Image.open(path)
-    if img.mode in ("RGBA", "P"):
-        img = img.convert("RGB")
-    img.thumbnail((VISION_MAX_EDGE, VISION_MAX_EDGE), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=VISION_QUALITY)
-    data_url = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
-
-    resp = requests.post(
-        VISION_ENDPOINT,
-        headers={
-            "Authorization": f"Bearer {os.environ['OPENCODE_API_KEY']}",
-            "Content-Type": "application/json",
-            # Cloudflare blocks the python-requests default UA (error 1010).
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        },
-        json={
-            "model": VISION_MODEL,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": VISION_PROMPT},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }],
-        },
-        timeout=CONVERT_TIMEOUT_S,
-    )
-    resp.raise_for_status()
-    return (resp.json().get("choices") or [{}])[0].get("message", {}).get("content") or ""
+# _describe_image is imported from app.services.file_convert
 
 
 def _convert(attachment_id: str) -> None:
@@ -190,8 +142,9 @@ async def upload_attachments(
             raise HTTPException(413, f"{f.filename}: exceeds {MAX_BYTES} bytes")
 
         attachment_id = uuid.uuid4().hex
+        stem = Path(f.filename or "file").stem
         suffix = Path(f.filename or "file").suffix.lower()
-        dest = UPLOAD_DIR / f"{attachment_id}{suffix}"
+        dest = UPLOAD_DIR / f"{stem}__{attachment_id[:8]}{suffix}"
         dest.write_bytes(data)
 
         with db() as conn:

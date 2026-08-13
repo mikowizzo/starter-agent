@@ -5,6 +5,7 @@ import difflib
 import fcntl
 import functools
 import hashlib
+import logging
 import os
 import re
 import shlex
@@ -16,6 +17,24 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# ── Binary file conversion (documents + images) ──────────────────────
+from app.services.file_convert import convert_to_text, IMAGE_EXTS, MARKITDOWN_EXTS
+from app.services.url_fetch import fetch_url, is_url
+
+_CONVERTIBLE_EXTS = MARKITDOWN_EXTS | IMAGE_EXTS
+
+
+def _try_convert(path: Path) -> tuple[str, str] | None:
+    """Convert a binary file to text. Returns (text, method) or None."""
+    if path.suffix.lower() not in _CONVERTIBLE_EXTS:
+        return None
+    text, method = convert_to_text(path)
+    if text:
+        return text, method
+    return None
 
 from agno.tools import Toolkit
 
@@ -231,11 +250,25 @@ class CodeTools(Toolkit):
         try:
             text = resolved.read_text(encoding="utf-8")
         except UnicodeDecodeError:
+            # Binary file — try converting (markitdown for docs, vision for images)
+            conv = _try_convert(resolved)
+            if conv is not None:
+                md_text, _method = conv
+                raw_lines = self._split_lines(md_text)
+                norm_lines = [self._normalize_line(l) for l in raw_lines]
+                return resolved, raw_lines, norm_lines
             return f"❌ Cannot decode {path} as UTF-8 (binary file?)"
         except OSError as exc:
             return f"❌ Cannot read {path}: {exc}"
         # NUL byte check — likely binary
         if "\x00" in text[:8192]:
+            # Binary file — try converting (markitdown for docs, vision for images)
+            conv = _try_convert(resolved)
+            if conv is not None:
+                md_text, _method = conv
+                raw_lines = self._split_lines(md_text)
+                norm_lines = [self._normalize_line(l) for l in raw_lines]
+                return resolved, raw_lines, norm_lines
             return f"❌ Binary file (NUL byte detected): {path}"
         raw_lines = self._split_lines(text)
         norm_lines = [self._normalize_line(l) for l in raw_lines]
@@ -367,18 +400,68 @@ class CodeTools(Toolkit):
         norm_lines[start : start + len(old_norm)] = new_norm
         return None
 
-    def read(self, path: str, offset: int = 0, limit: int = 500) -> str:
+    def read(
+        self,
+        path: str,
+        offset: int = 0,
+        limit: int = 500,
+        wait_for_selector: str | None = None,
+        max_wait_ms: int | None = None,
+    ) -> str:
         """Read a file slice by line number. Output has 1-indexed line numbers.
+
+        Also accepts URLs (http/https). Web pages are extracted via
+        trafilatura → Playwright → Jina Reader; YouTube links are
+        auto-transcribed.
+
+        For JS-heavy pages (SPAs), wait_for_selector waits for a specific
+        element to mount before extracting (e.g. ".model-card"), and
+        max_wait_ms caps how long we poll for async content (default 15s).
 
         The header includes a content hash. Pass that hash as `expected_hash`
         to `edit()` for optimistic concurrency — if the file changed since you
         read it, the edit is refused.
 
         Args:
-            path: Relative path to the file.
+            path: Relative path to a file, or an http(s) URL.
             offset: Zero-based line to start reading from.
             limit: Max lines to return (hard-capped at 2000).
+            wait_for_selector: CSS selector to wait for (URL mode only).
+            max_wait_ms: Cap on the SPA settle poll in ms (URL mode only).
         """
+        # ── URL mode ──
+        if is_url(path):
+            fetched = fetch_url(
+                path,
+                wait_for_selector=wait_for_selector,
+                max_wait_ms=max_wait_ms,
+            )
+            if fetched.get("error"):
+                return f"❌ Failed to fetch {path}: {fetched['error']}"
+            content = fetched.get("content", "")
+            if not content:
+                return f"❌ No content extracted from {path}"
+            raw = self._split_lines(content)
+            total = len(raw)
+            method = fetched.get("method", "unknown")
+            title = fetched.get("title") or ""
+            slice_lines = raw[offset : offset + min(limit, 2000)]
+            end = offset + len(slice_lines)
+            width = len(str(end))
+            numbered = [
+                f"{offset + i + 1:>{width}}: {line}"
+                for i, line in enumerate(slice_lines)
+            ]
+            header = f"[fetched {path}"
+            if title:
+                header += f" — {title}"
+            header += f" | {total} lines | method={method}]"
+            out = header + "\n" + "\n".join(numbered)
+            if end < total:
+                out += f"\n[read more with offset={end}]"
+            return out
+
+        # ── File mode ──
         result = self._read_lines(path)
         if isinstance(result, str):
             return result
@@ -402,7 +485,15 @@ class CodeTools(Toolkit):
             f"{offset + i + 1:>{width}}: {line}" for i, line in enumerate(slice_lines)
         ]
         out = (
-            f"[lines {offset + 1}–{end} of {total} in {path} | hash={file_hash}]\n"
+            f"[lines {offset + 1}–{end} of {total} in {path} | hash={file_hash}]"
+            + (
+                "  ⟶ converted from binary by markitdown"
+                if _resolved.suffix.lower() in MARKITDOWN_EXTS
+                else "  ⟶ described by vision model"
+                if _resolved.suffix.lower() in IMAGE_EXTS
+                else ""
+            )
+            + "\n"
             + "\n".join(numbered)
         )
         if end < total:

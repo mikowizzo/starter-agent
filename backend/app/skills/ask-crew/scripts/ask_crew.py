@@ -58,7 +58,7 @@ def route(entry: tuple) -> tuple[str, str]:
         return url, key_env
     return BASE_URL, KEY_ENV
 
-TIMEOUT = 300
+TIMEOUT = 600  # 10 min per model — long enough for complex queries
 # Per-file inlining cap. Large files blow the context window; truncate with a
 # marker so the model still sees the structure.
 MAX_FILE_BYTES = 100_000
