@@ -25,6 +25,7 @@ Reads SYNTHETIC_API_KEY (Kimi K3) and OPENROUTER_API_KEY
 (Grok 4.6, Gemini 3.7 Flash) from the env.
 """
 import concurrent.futures
+import hashlib
 import json
 import os
 import sys
@@ -67,6 +68,9 @@ TIMEOUT = 600  # 10 min per model — long enough for complex queries
 # Per-file inlining cap. Large files blow the context window; truncate with a
 # marker so the model still sees the structure.
 MAX_FILE_BYTES = 100_000
+# Rough chars-per-token for the cache-hint estimate. Display-only; the real
+# prefix size is whatever the provider's tokenizer produces.
+CHARS_PER_TOKEN = 4
 # Cloudflare 403s Python-urllib's default UA (error 1010) — browser UA required.
 HEADERS = {
     "Authorization": "Bearer {key}",
@@ -91,6 +95,17 @@ def get_env_key(name: str) -> str:
         except OSError:
             pass
     return ""
+
+
+def _stable_path_key(path: str) -> str:
+    """Deterministic sort key for a file path.
+
+    Uses sha256 of the path string — NOT built-in hash(), which is salted by
+    PYTHONHASHSEED and changes across processes. A stable ordering of file
+    blocks keeps the prompt prefix byte-for-byte identical between runs, so
+    provider-side prompt caching (KV-cache reuse) actually engages.
+    """
+    return hashlib.sha256(path.encode("utf-8")).hexdigest()
 
 
 def read_file_block(path: str) -> str | None:
@@ -141,9 +156,19 @@ def build_prompt(query: str, files: list[str]) -> str:
 
     If ``query`` is empty and at least one file was inlined, defaults to
     "Please review the file(s) above." so file-only invocations work.
+
+    Prompt-cache hygiene: file blocks are emitted in a deterministic order
+    (sorted by a stable sha256 of the path), independent of CLI arg order.
+    Provider KV-cache reuse keys on an identical prompt prefix, so
+    "--file a.py --file b.py" and "--file b.py --file a.py" now produce the
+    SAME prefix and hit the cache on repeat runs. File contents themselves
+    are untouched — only the block order changes. The question always comes
+    last so the entire file section remains a cacheable static prefix.
     """
     blocks: list[str] = []
-    for path in files:
+    # Sort BEFORE reading so even unreadable files can't perturb the order
+    # of the survivors (they're skipped with a warning downstream).
+    for path in sorted(files, key=_stable_path_key):
         block = read_file_block(path)
         if block is None:
             print(f"WARNING: file not found or not readable: {path}", file=sys.stderr)
@@ -152,6 +177,12 @@ def build_prompt(query: str, files: list[str]) -> str:
     if not query and blocks:
         query = "Please review the file(s) above."
     if blocks:
+        prefix_chars = sum(len(b) for b in blocks)
+        est_tokens = prefix_chars // CHARS_PER_TOKEN
+        print(
+            f"📎 Files sorted for cache reuse "
+            f"({len(blocks)} blocks, ~{est_tokens:,} tokens prefix)"
+        )
         blocks.append(f"--- question ---\n{query}")
         return "\n\n".join(blocks)
     return query
