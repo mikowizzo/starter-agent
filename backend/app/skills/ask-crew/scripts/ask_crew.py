@@ -12,6 +12,7 @@ Usage:
   python ask_crew.py --file README.md         # default: "please review"
   python ask_crew.py --history                # show recent runs from the ledger
   python ask_crew.py --history 20             # show last 20 runs
+  python ask_crew.py --no-claims "quick question"  # skip claim cartography
 
 Allowed --models ids (exact match; anything else is rejected with this list):
   hf:moonshotai/Kimi-K3    Kimi K3            (Synthetic)
@@ -44,8 +45,11 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import re
 import sqlite3
+import string
 import sys
+import textwrap
 import time
 import urllib.request
 import uuid
@@ -76,6 +80,28 @@ CREW = [
 # assume the agreement is wrong. Kimi still answers normally as part of the
 # crew; this is an ADDITIONAL adversarial call on the same prompt.
 HERETIC_MODEL_ID = "hf:moonshotai/Kimi-K3"
+
+# Main system prompt for crew models. Asks for structured CLAIMS: section at
+# the end so the local cartography engine can extract and compare them.
+MAIN_SYSTEM_PROMPT = (
+    "You are one member of a small panel of expert models answering a user's "
+    "question independently. Give your honest, complete, direct answer.\n\n"
+    "FORMATTING CONTRACT (mandatory):\n"
+    "At the very end of your response, include a CLAIMS: section with one "
+    "atomic claim per line, each prefixed exactly with \"CLAIM: \".\n"
+    "Rules for claims:\n"
+    "  - One single, self-contained assertion per line. No compound sentences.\n"
+    "  - Each claim must stand alone without the rest of your answer.\n"
+    "  - Capture your key factual statements, recommendations, and conclusions.\n"
+    "  - Use plain wording so the same claim from another model reads nearly "
+    "identically — shared nouns and verbs.\n"
+    "  - Write between 3 and 10 claims. Quality over quantity.\n\n"
+    "Example tail of your response:\n\n"
+    "CLAIMS:\n"
+    "CLAIM: SQLite WAL mode is sufficient for this write volume.\n"
+    "CLAIM: The bottleneck is disk I/O, not CPU.\n"
+)
+
 HERETIC_SYSTEM_PROMPT = (
     "You are the DESIGNATED HERETIC on a panel of AI models answering the "
     "same question. The other models will likely converge on a consensus "
@@ -89,7 +115,20 @@ HERETIC_SYSTEM_PROMPT = (
     "- Be adversarial but constructive: every objection should point toward "
     "a better answer, not just tear things down.\n"
     "Do NOT hedge or summarize both sides. Commit to the strongest "
-    "counter-argument."
+    "counter-argument.\n\n"
+    "FORMATTING CONTRACT (mandatory):\n"
+    "At the very end of your response, include a DISSENT: section with one "
+    "atomic objection per line, each prefixed exactly with \"DISSENT: \".\n"
+    "Rules for dissent lines:\n"
+    "  - One single, self-contained objection per line.\n"
+    "  - Each line must target the specific claim or assumption it attacks, "
+    "reusing the claim's key nouns and verbs so the disagreement can be "
+    "mechanically matched.\n"
+    "  - Write between 2 and 8 dissent lines.\n\n"
+    "Example tail of your response:\n\n"
+    "DISSENT:\n"
+    "DISSENT: WAL mode degrades badly on network filesystems.\n"
+    "DISSENT: In-place migration fails at table-lock time beyond 10M rows.\n"
 )
 
 
@@ -103,7 +142,7 @@ HERETIC_SYSTEM_PROMPT = (
 # Elo/claims — those land as migrations when the features are built.
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -145,6 +184,24 @@ CREATE TRIGGER IF NOT EXISTS runs_ai AFTER INSERT ON runs BEGIN
 END;
 """
 
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS claims (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    response_id       INTEGER REFERENCES responses(response_id),
+    run_id            TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    model_id          TEXT NOT NULL,
+    role              TEXT NOT NULL DEFAULT 'council',
+    kind              TEXT NOT NULL DEFAULT 'claim',   -- 'claim' | 'dissent'
+    claim_text        TEXT NOT NULL,                    -- verbatim, never paraphrased
+    normalized        TEXT NOT NULL,                    -- for clustering comparison
+    cluster_id        INTEGER,
+    status            TEXT NOT NULL DEFAULT 'unique'   -- consensus|majority|disputed|dissent|unique
+);
+CREATE INDEX IF NOT EXISTS idx_claims_run      ON claims(run_id);
+CREATE INDEX IF NOT EXISTS idx_claims_response ON claims(response_id);
+CREATE INDEX IF NOT EXISTS idx_claims_cluster  ON claims(cluster_id);
+"""
+
 _LEDGER_DISABLED = False  # sticky: one write failure disables writes for the process
 
 
@@ -176,8 +233,12 @@ def _open_ledger(path: str | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
-    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < 1:
         conn.executescript(SCHEMA_SQL)
+    if version < 2:
+        conn.executescript(SCHEMA_V2)
+    if version < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     return conn
 
@@ -411,16 +472,236 @@ def ask(
         return model_id, f"ERROR: {type(e).__name__}: {e}", time.monotonic() - t0, {"prompt_tokens": 0, "completion_tokens": 0}
 
 
-def parse_args(argv: list[str]) -> tuple[list[str], list[str], str, bool, int]:
-    """Parse CLI into (models, files, query, history_flag, history_limit).
+# ---------------------------------------------------------------------------
+# Claim Cartography — local, deterministic, zero extra model calls
+# (Option A: structured claims at source, verbatim display)
+# ---------------------------------------------------------------------------
+
+# Regex tolerates optional bullet markers and case variance before the prefix.
+_CLAIM_LINE_RE = re.compile(
+    r"^\s*(?:[-*~•]\s*|\d+[.)]\s*)?(CLAIM|DISSENT)\s*:\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+
+CLAIM_SIMILARITY_THRESHOLD = 0.5
+
+
+def extract_claims_tagged(text: str, role: str) -> list[tuple[str, str]]:
+    """Pull CLAIM:/DISSENT: lines from a response.
+
+    Returns list of (kind, verbatim_text). kind is 'dissent' for DISSENT:
+    lines (or any prefixed line from the heretic), else 'claim'.
+    """
+    if not text:
+        return []
+    preferred = "DISSENT" if role == "heretic" else "CLAIM"
+    found = []
+    for line in text.splitlines():
+        m = _CLAIM_LINE_RE.match(line)
+        if not m:
+            continue
+        tag = m.group(1).upper()
+        body = m.group(2).strip().strip("*`")
+        if not body:
+            continue
+        kind = "dissent" if (tag == "DISSENT" or role == "heretic") else "claim"
+        found.append((0 if tag == preferred else 1, kind, body))
+    # Stable sort: preferred-prefix lines first, preserving line order.
+    found.sort(key=lambda t: t[0])
+    return [(kind, body) for _, kind, body in found]
+
+
+def normalize_claim(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — comparison only."""
+    return " ".join(text.lower().translate(_PUNCT_TABLE).split())
+
+
+def _similarity(tokens_a: set, tokens_b: set) -> float:
+    """max(Jaccard, containment*0.9). Containment rescues pairs where one
+    claim is a superset of another, which Jaccard punishes."""
+    if not tokens_a or not tokens_b:
+        return 0.0
+    inter = len(tokens_a & tokens_b)
+    if inter == 0:
+        return 0.0
+    jaccard = inter / len(tokens_a | tokens_b)
+    containment = inter / min(len(tokens_a), len(tokens_b))
+    return max(jaccard, containment * 0.9)
+
+
+def cluster_claims(all_claims: list[dict]) -> list[dict]:
+    """Greedy single-linkage clustering by token-overlap similarity.
+
+    Deterministic: input order is fixed (crew order, then heretic, then
+    line order). Each claim joins the best-matching existing cluster if
+    similarity >= threshold, else seeds a new one.
+
+    Returns list of {"cluster_id": int, "members": [claim_dict, ...]}.
+    """
+    for c in all_claims:
+        c["_tokens"] = set(c["normalized"].split())
+
+    clusters: list[dict] = []
+    for c in all_claims:
+        best_idx, best_score = -1, 0.0
+        for i, cl in enumerate(clusters):
+            score = max(_similarity(c["_tokens"], m["_tokens"]) for m in cl["members"])
+            if score > best_score:
+                best_idx, best_score = i, score
+        if best_score >= CLAIM_SIMILARITY_THRESHOLD:
+            clusters[best_idx]["members"].append(c)
+        else:
+            clusters.append({"members": [c]})
+
+    for i, cl in enumerate(clusters):
+        cl["cluster_id"] = i + 1
+        for m in cl["members"]:
+            m.pop("_tokens", None)
+    return clusters
+
+
+def classify_cluster(cluster: dict, crew_count: int) -> str:
+    """consensus / majority / disputed / dissent / unique.
+
+    A cluster mixing crew CLAIMs with heretic DISSENTs is a dispute.
+    Heretic-only clusters are 'dissent' (unanswered attack surface).
+    """
+    members = cluster["members"]
+    supporters = {m["model_id"] for m in members if m["kind"] == "claim"}
+    dissenters = {m["model_id"] for m in members if m["kind"] == "dissent"}
+
+    if supporters and dissenters:
+        return "disputed"
+    if dissenters:
+        return "dissent"
+    if crew_count > 1 and len(supporters) >= crew_count:
+        return "consensus"
+    if len(supporters) >= 2:
+        return "majority"
+    return "unique"
+
+
+_STATUS_ORDER = ["consensus", "majority", "disputed", "dissent", "unique"]
+_STATUS_TITLES = {
+    "consensus": "CONSENSUS — all crew models support",
+    "majority":  "MAJORITY — 2+ crew models support",
+    "disputed":  "DISPUTED — crew claim vs heretic dissent",
+    "dissent":   "HERETIC DISSENT — unanswered attack surface",
+    "unique":    "UNIQUE — singleton insights",
+}
+_STATUS_ICONS = {"consensus": "✅", "majority": "➖", "disputed": "⚔️", "dissent": "🎭", "unique": "💡"}
+
+
+def display_claim_map(clusters: list[dict], total_claims: int, responder_count: int) -> None:
+    """Render the claim cartography matrix to stdout.
+
+    VERBATIM quotes only, with response attribution. A bad cluster is
+    visibly a bad cluster of literal quotes — never a paraphrase.
+    """
+    w = 78
+    print()
+    print("=" * w)
+    print(f"📋 CLAIM CARTOGRAPHY — {total_claims} claims from {responder_count} responses "
+          f"→ {len(clusters)} clusters")
+    print(f"   (deterministic local clustering, verbatim quotes; threshold {CLAIM_SIMILARITY_THRESHOLD})")
+    print("=" * w)
+
+    for status in _STATUS_ORDER:
+        group = [c for c in clusters if c["status"] == status]
+        if not group:
+            continue
+        print()
+        print(f"{_STATUS_ICONS[status]} {_STATUS_TITLES[status]} — {len(group)} cluster(s)")
+        print("-" * w)
+        for cl in group:
+            print(f"  Cluster #{cl['cluster_id']}:")
+            supporters = [m for m in cl["members"] if m["kind"] == "claim"]
+            dissenters = [m for m in cl["members"] if m["kind"] == "dissent"]
+            for m in supporters:
+                print(textwrap.fill(
+                    f"  + [{m['label']}] \"{m['text']}\"",
+                    width=w, initial_indent="    ", subsequent_indent="      "))
+            for m in dissenters:
+                print(textwrap.fill(
+                    f"  - [{m['label']}] \"{m['text']}\"",
+                    width=w, initial_indent="    ", subsequent_indent="      "))
+    print()
+    print("=" * w)
+
+
+def _store_claims(conn, run_id: str, clusters: list[dict]) -> None:
+    """Persist extracted claims to the ledger (claims table).
+
+    response_id may be None if the lookup didn't find a match (e.g. heretic
+    reuses the same model_id as a crew member); claims are still useful for
+    display and re-rendering even without the FK.
+    """
+    for cl in clusters:
+        for m in cl["members"]:
+            conn.execute(
+                "INSERT INTO claims (response_id, run_id, model_id, role, "
+                "kind, claim_text, normalized, cluster_id, status) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (m.get("response_id"), run_id, m["model_id"], m["role"],
+                 m["kind"], m["text"], m["normalized"],
+                 cl["cluster_id"], cl["status"]),
+            )
+    conn.commit()
+
+
+def run_claim_cartography(
+    ok_results: list[dict],
+    run_id: str,
+    crew_count: int,
+) -> None:
+    """Extract, cluster, classify, persist, and display the claim map.
+
+    Silently no-ops if models didn't follow the CLAIMS/DISSENT format.
+    """
+    all_claims = []
+    for r in ok_results:
+        for kind, body in extract_claims_tagged(r["text"], r.get("role", "council")):
+            all_claims.append({
+                "model_id": r["model_id"],
+                "label": r.get("label", r["model_id"]),
+                "role": r.get("role", "council"),
+                "kind": kind,
+                "text": body,
+                "normalized": normalize_claim(body),
+                "response_id": r.get("response_id"),
+            })
+
+    if not all_claims:
+        return  # models didn't follow the format — silently skip
+
+    clusters = cluster_claims(all_claims)
+    for cl in clusters:
+        cl["status"] = classify_cluster(cl, crew_count)
+
+    # Persist to ledger
+    try:
+        conn = _open_ledger()
+        _store_claims(conn, run_id, clusters)
+        conn.close()
+    except Exception as e:
+        print(f"[ledger] WARNING: claims write failed: {e}", file=sys.stderr)
+
+    display_claim_map(clusters, len(all_claims), len(ok_results))
+
+
+def parse_args(argv: list[str]) -> tuple[list[str], list[str], str, bool, int, bool]:
+    """Parse CLI into (models, files, query, history_flag, history_limit, no_claims).
 
     --history [N]  shows recent runs from the ledger and exits.
+    --no-claims    skip claim cartography.
     """
     models: list[str] = [e[0] for e in CREW]
     files: list[str] = []
     rest: list[str] = []
     history = False
     history_limit = 10
+    no_claims = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -444,11 +725,14 @@ def parse_args(argv: list[str]) -> tuple[list[str], list[str], str, bool, int]:
                 i += 2
             else:
                 i += 1
+        elif a == "--no-claims":
+            no_claims = True
+            i += 1
         else:
             rest.append(a)
             i += 1
     query = " ".join(rest).strip()
-    return models, files, query, history, history_limit
+    return models, files, query, history, history_limit, no_claims
 
 
 def _cost(entry: tuple | None, usage: dict) -> float:
@@ -462,7 +746,7 @@ def _cost(entry: tuple | None, usage: dict) -> float:
 
 
 def main() -> int:
-    models, files, query, history, history_limit = parse_args(sys.argv[1:])
+    models, files, query, history, history_limit, no_claims = parse_args(sys.argv[1:])
 
     # --history: read-only ledger view, then exit
     if history:
@@ -505,7 +789,7 @@ def main() -> int:
 
     t0 = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_calls) as pool:
-        futures = [pool.submit(ask, e[0], prompt, base_url, key) for e, base_url, key in jobs]
+        futures = [pool.submit(ask, e[0], prompt, base_url, key, MAIN_SYSTEM_PROMPT) for e, base_url, key in jobs]
         heretic_future = None
         if heretic_job:
             entry, base_url, key = heretic_job
@@ -579,7 +863,7 @@ def main() -> int:
 
     # Persist to ledger (never crashes the main flow)
     status = "partial" if has_error else "ok"
-    record_run(
+    run_id = record_run(
         query=query,
         files=files,
         models_asked=[e[0][0] for e, _, _ in jobs],
@@ -587,6 +871,35 @@ def main() -> int:
         wall_seconds=wall_seconds,
         status=status,
     )
+
+    # Claim Cartography: local, deterministic, zero extra model calls.
+    # Fires after ledger write so response_ids are available. Silently
+    # skips if models didn't follow the CLAIMS/DISSENT format.
+    if not no_claims and run_id:
+        # Enrich results with response_ids from the ledger for claim storage
+        try:
+            conn = _open_ledger()
+            resp_rows = conn.execute(
+                "SELECT response_id, model_id, role FROM responses WHERE run_id = ? ORDER BY id",
+                (run_id,),
+            ).fetchall()
+            conn.close()
+            # Build a lookup: (model_id, role) -> response_id
+            rid_map = {}
+            for row in resp_rows:
+                key = (row["model_id"], row["role"])
+                rid_map[key] = row["response_id"]
+            # Attach response_ids to ledger_responses for cartography
+            for r in ledger_responses:
+                r["response_id"] = rid_map.get((r["model_id"], r["role"]))
+        except Exception as e:
+            print(f"[ledger] WARNING: response_id lookup failed: {e}", file=sys.stderr)
+
+        ok_results = [r for r in ledger_responses if not r.get("error")]
+        crew_count = sum(1 for r in ok_results if r.get("role") == "council")
+        if len(ok_results) >= 2:
+            run_claim_cartography(ok_results, run_id, crew_count)
+
     return 0
 
 
