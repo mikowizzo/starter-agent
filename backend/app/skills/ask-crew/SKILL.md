@@ -1,20 +1,21 @@
 ---
 name: ask-crew
 description: >
-  Fire one query at multiple MODELS in parallel (MiniMax M3, Kimi K3 via
-  Synthetic, Qwen 3.8 Max, GLM 5.2) and print each answer. Use to compare how
-  different MODELS answer the same question. IMPORTANT: this queries AI MODELS
-  via the OpenCode/Synthetic APIs — NOT the clone crew members (franky, nami,
-  etc.). Do NOT use the talk_to tool for this. Reads OPENCODE_API_KEY from the
-  environment (SYNTHETIC_API_KEY for Kimi K3).
+  Fire one query at multiple MODELS in parallel (Kimi K3 via Synthetic,
+  DeepSeek V4 Pro 0813, Grok 4.6, Gemini 3.7 Flash) and print each answer.
+  Use to compare how different MODELS answer the same question.
+  IMPORTANT: this queries AI MODELS via the Synthetic/OpenRouter APIs
+  — NOT the clone crew members (franky, nami, etc.). Do NOT use the
+  talk_to tool for this. Reads SYNTHETIC_API_KEY for Kimi K3,
+  OPENROUTER_API_KEY for DeepSeek V4 Pro 0813, Grok 4.6, and Gemini 3.7 Flash.
 license: MIT
 ---
 
 # Ask Crew
-Asks the "model crew" — four MODELS (MiniMax M3, Kimi K3 via Synthetic,
-Qwen 3.8 Max, GLM 5.2) answer the same query in parallel and their answers
-are printed side by side. All route through OpenCode except Kimi K3, which
-uses the Synthetic API (SYNTHETIC_API_KEY).
+Asks the "model crew" — four MODELS (Kimi K3 via Synthetic,
+DeepSeek V4 Pro 0813, Grok 4.6, Gemini 3.7 Flash) answer the same query in
+parallel and their answers are printed side by side. Each has a bespoke
+route: Kimi K3 (Synthetic), the rest via OpenRouter.
 
 > ⚠️ This is about MODELS, not crew-member clones. "Ask the crew" =
 > this script. To message a Straw Hat clone (franky, nami, ...) use the
@@ -28,7 +29,7 @@ Preferred — invoke through the skill access tools (never shell):
 Legacy shell usage (kept for reference, not recommended):
 
     python backend/app/skills/ask-crew/scripts/ask_crew.py "What's the best way to..."
-    python backend/app/skills/ask-crew/scripts/ask_crew.py --models minimax-m3,GLM-5.2 "..."
+    python backend/app/skills/ask-crew/scripts/ask_crew.py --models x-ai/grok-4.6,deepseek/deepseek-v4-pro-0813 "..."
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file path/to/code.py "review this"
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file a.py --file b.py "compare these"
     python backend/app/skills/ask-crew/scripts/ask_crew.py --file README.md   # defaults to "please review"
@@ -41,10 +42,10 @@ can never silently route to the wrong API.
 
 | Model | `--models` id | Route |
 |---|---|---|
-| MiniMax M3 | `minimax-m3` | OpenCode (`OPENCODE_API_KEY`) |
 | Kimi K3 | `hf:moonshotai/Kimi-K3` | Synthetic (`SYNTHETIC_API_KEY`) |
-| Qwen 3.8 Max | `qwen3.8-max` | OpenCode (`OPENCODE_API_KEY`) |
-| GLM 5.2 | `GLM-5.2` | ZAI (`ZAI_API_KEY`) |
+| DeepSeek V4 Pro 0813 | `deepseek/deepseek-v4-pro-0813` | OpenRouter (`OPENROUTER_API_KEY`) |
+| Grok 4.6 | `x-ai/grok-4.6` | OpenRouter (`OPENROUTER_API_KEY`) |
+| Gemini 3.7 Flash | `google/gemini-3.7-flash` | OpenRouter (`OPENROUTER_API_KEY`) |
 
 Default (no `--models`): all four.
 

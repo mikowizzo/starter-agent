@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 """Ask the model crew — fire one query at multiple models in parallel.
 
-Most models route through OpenCode; Kimi K3 routes through the Synthetic API
-(SYNTHETIC_API_KEY). See CREW below.
+Each model uses a bespoke route (Synthetic / ZAI / OpenRouter) — see CREW
+below.
 
 Usage:
   python ask_crew.py "your question here"
-  python ask_crew.py --models minimax-m3,hf:moonshotai/Kimi-K3 "your question"
+  python ask_crew.py --models x-ai/grok-4.6,deepseek/deepseek-v4-pro-0813 "your question"
   python ask_crew.py --file path/to/code.py "review this"
   python ask_crew.py --file a.py --file b.py "compare these"
   python ask_crew.py --file README.md         # default: "please review"
 
 Allowed --models ids (exact match; anything else is rejected with this list):
-  minimax-m3               MiniMax M3       (OpenCode)
-  hf:moonshotai/Kimi-K3    Kimi K3          (Synthetic)
-  qwen3.8-max              Qwen 3.8 Max     (OpenCode)
-  GLM-5.2                  GLM 5.2          (ZAI)
+  hf:moonshotai/Kimi-K3          Kimi K3               (Synthetic)
+  deepseek/deepseek-v4-pro-0813  DeepSeek V4 Pro 0813  (OpenRouter)
+  x-ai/grok-4.6                  Grok 4.6              (OpenRouter)
+  google/gemini-3.7-flash        Gemini 3.7 Flash      (OpenRouter)
   (default: all of the above)
 
 Pass one or more --file PATH args to inline file contents into the prompt.
 Text files are inlined; binary files are noted but not inlined. Files larger
 than MAX_FILE_BYTES are truncated with a warning.
 
-Reads OPENCODE_API_KEY (and SYNTHETIC_API_KEY for Kimi K3) from the env.
+Reads SYNTHETIC_API_KEY (Kimi K3) and OPENROUTER_API_KEY
+(DeepSeek V4 Pro 0813, Grok 4.6, Gemini 3.7 Flash) from the env.
 """
 import concurrent.futures
 import json
@@ -39,12 +40,14 @@ KEY_ENV = "OPENCODE_API_KEY"
 # Two-tuples route via OpenCode (BASE_URL + OPENCODE_API_KEY); four-tuples
 # override the route — e.g. Kimi K3 goes through the Synthetic API instead.
 CREW = [
-    ("minimax-m3", "MiniMax M3"),
     ("hf:moonshotai/Kimi-K3", "Kimi K3 (Synthetic)",
      "https://api.synthetic.new/v1", "SYNTHETIC_API_KEY"),
-    ("qwen3.8-max", "Qwen 3.8 Max"),
-    ("GLM-5.2", "GLM 5.2 (ZAI)",
-     "https://api.z.ai/api/coding/paas/v4", "ZAI_API_KEY"),
+    ("deepseek/deepseek-v4-pro-0813", "DeepSeek V4 Pro 0813 (OpenRouter)",
+     "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+    ("x-ai/grok-4.6", "Grok 4.6 (OpenRouter)",
+     "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+    ("google/gemini-3.7-flash", "Gemini 3.7 Flash (OpenRouter)",
+     "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
 ]
 
 
