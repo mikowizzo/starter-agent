@@ -149,11 +149,19 @@ _LEDGER_DISABLED = False  # sticky: one write failure disables writes for the pr
 
 
 def _default_db_path() -> str:
-    """Resolve the ledger path. CREW_LEDGER_DB env overrides the default."""
+    """Resolve the ledger path.
+
+    Priority: CREW_LEDGER_DB env var > repo-adjacent data/crew/crew_ledger.db.
+
+    Repo-adjacent (not XDG) so the ledger survives container restarts, stays
+    visible to backup tooling, and is never inside the skill folder that gets
+    docker-cp'd to clones (which would clobber or fork the DB).
+    """
     if p := os.environ.get("CREW_LEDGER_DB"):
         return p
-    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return os.path.join(base, "crew", "crew_ledger.db")
+    # This file: <repo>/backend/app/skills/ask-crew/scripts/ask_crew.py
+    repo_root = Path(__file__).resolve().parents[5]
+    return str(repo_root / "data" / "crew" / "crew_ledger.db")
 
 
 def _ledger_enabled() -> bool:

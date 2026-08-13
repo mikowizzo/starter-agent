@@ -5,6 +5,10 @@
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
+
+# Crew ledger (repo-adjacent runtime data)
+data/crew/
 
 # Python
 __pycache__/
