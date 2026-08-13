@@ -43,6 +43,7 @@ Reads SYNTHETIC_API_KEY (Kimi K3) and OPENROUTER_API_KEY
 """
 import concurrent.futures
 import hashlib
+import socket
 import itertools
 import json
 import os
@@ -76,6 +77,27 @@ CREW = [
      "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
      0.75, 3.75),
 ]
+
+# Checkpoint directory for streaming partial results
+CHECKPOINT_ROOT = None  # resolved lazily via _checkpoint_root()
+
+
+def _checkpoint_root() -> Path:
+    """data/crew/runs/ — sibling of the ledger DB."""
+    global CHECKPOINT_ROOT
+    if CHECKPOINT_ROOT is not None:
+        return CHECKPOINT_ROOT
+    repo_root = Path(__file__).resolve().parents[5]
+    CHECKPOINT_ROOT = repo_root / "data" / "crew" / "runs"
+    CHECKPOINT_ROOT.mkdir(parents=True, exist_ok=True)
+    return CHECKPOINT_ROOT
+
+
+def _model_slug(model_id: str) -> str:
+    """Filesystem-safe slug for a model id."""
+    import re as _re
+    return _re.sub(r"[^A-Za-z0-9_.-]+", "_", model_id).strip("_") or "model"
+
 
 # Designated heretic — hardcoded, always Kimi K3. Inspired by intelligence
 # analysis's "tenth man rule": when everyone agrees, someone is assigned to
@@ -381,7 +403,11 @@ def route(entry: tuple) -> tuple[str, str]:
         return url, key_env
     return BASE_URL, KEY_ENV
 
-TIMEOUT = 600  # 10 min per model — long enough for complex queries
+# Streaming + checkpointing timeouts
+IDLE_TIMEOUT = 90        # max seconds of silence between SSE chunks (dead connection)
+FIRST_TOKEN_TIMEOUT = 180  # generous pre-first-token window (some models queue/think)
+WALL_CLOCK_CAP = 1200    # absolute per-stream cap (20 min) — ensures threads provably die
+QUORUM_DEADLINE = 510    # inner deadline (8.5 min) — returns before agent's 10-min kill
 MAX_FILE_BYTES = 100_000
 CHARS_PER_TOKEN = 4
 HEADERS = {
@@ -484,34 +510,136 @@ def ask(
     base_url: str,
     key: str,
     system: str | None = None,
+    role_tag: str = "council",
+    run_id: str | None = None,
 ) -> tuple[str, str, float, dict]:
-    """Ask one model, return (model_id, content_or_error, elapsed_seconds, usage)."""
+    """Ask one model via SSE streaming with disk checkpointing.
+
+    Every content delta is immediately appended (line-buffered) to
+    data/crew/runs/<run_id>/<role>_<model_slug>.jsonl so partial work
+    survives process kills. A .final marker sibling is written on success;
+    any .jsonl without a .final is recoverable partial work.
+
+    Returns (model_id, content_or_error, elapsed_seconds, usage).
+    """
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": query})
-    body = json.dumps({"model": model_id, "messages": messages}).encode()
+    body = json.dumps({
+        "model": model_id,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},  # heretic catch: usage not sent without this
+    }).encode()
     req = urllib.request.Request(
         base_url,
         data=body,
         method="POST",
         headers={k: v.format(key=key) for k, v in HEADERS.items()},
     )
+
+    # Checkpoint paths
+    ckpt_dir = _checkpoint_root()
+    if run_id is None:
+        run_id = uuid.uuid4().hex[:12]
+    ckpt_subdir = ckpt_dir / run_id
+    ckpt_subdir.mkdir(parents=True, exist_ok=True)
+    slug = f"{role_tag}_{_model_slug(model_id)}"
+    jsonl_path = ckpt_subdir / f"{slug}.jsonl"
+    final_path = ckpt_subdir / f"{slug}.final"
+
     t0 = time.monotonic()
+    parts: list[str] = []
+    usage: dict = {"prompt_tokens": 0, "completion_tokens": 0}
+
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            data = json.loads(r.read())
-        content = (
-            (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        # urlopen timeout = per-read (idle) timeout, not wall-clock.
+        # 90s silence between chunks = dead connection.
+        resp = urllib.request.urlopen(req, timeout=IDLE_TIMEOUT)
+        with resp, open(jsonl_path, "w", buffering=1, encoding="utf-8") as ckpt:
+            first_token = True
+            for raw_line in resp:
+                # Heretic catch: check wall-clock cap so threads provably die
+                elapsed = time.monotonic() - t0
+                if elapsed > WALL_CLOCK_CAP:
+                    raise TimeoutError(
+                        f"wall-clock cap {WALL_CLOCK_CAP}s exceeded"
+                    )
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    evt = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+
+                # Usage may appear in any event, but typically the final one
+                if isinstance(evt.get("usage"), dict):
+                    u = evt["usage"]
+                    usage = {
+                        "prompt_tokens": u.get("prompt_tokens", 0),
+                        "completion_tokens": u.get("completion_tokens", 0),
+                    }
+
+                # Heretic catch: choices can be EMPTY on trailing usage-only chunk
+                choices = evt.get("choices") or []
+                if not choices:
+                    continue
+                delta = (choices[0].get("delta") or {}).get("content") or ""
+                if delta:
+                    # Heretic catch: generous pre-first-token tolerance
+                    if first_token:
+                        first_token = False
+                    parts.append(delta)
+                    ckpt.write(json.dumps(
+                        {"ts": time.time(), "chunk": delta},
+                        ensure_ascii=False,
+                    ) + "\n")  # line-buffered: flushed immediately
+
+    except (socket.timeout, TimeoutError) as e:
+        elapsed = time.monotonic() - t0
+        kept = sum(len(p) for p in parts)
+        return (
+            model_id,
+            f"ERROR: {type(e).__name__}: {e} "
+            f"({kept} chars checkpointed to {jsonl_path})",
+            elapsed,
+            usage,
         )
-        usage_raw = data.get("usage") or {}
-        usage = {
-            "prompt_tokens": usage_raw.get("prompt_tokens", 0),
-            "completion_tokens": usage_raw.get("completion_tokens", 0),
-        }
-        return model_id, content.strip() or "(empty reply)", time.monotonic() - t0, usage
     except Exception as e:
-        return model_id, f"ERROR: {type(e).__name__}: {e}", time.monotonic() - t0, {"prompt_tokens": 0, "completion_tokens": 0}
+        elapsed = time.monotonic() - t0
+        kept = sum(len(p) for p in parts)
+        return (
+            model_id,
+            f"ERROR: {type(e).__name__}: {e} "
+            f"({kept} chars checkpointed to {jsonl_path})",
+            elapsed,
+            usage,
+        )
+
+    # Success: write .final marker atomically (heretic: marker as SIBLING, not rename)
+    content = "".join(parts)
+    elapsed = time.monotonic() - t0
+    final_doc = {
+        "model": model_id,
+        "elapsed_s": round(elapsed, 3),
+        "usage": usage,
+        "chars": len(content),
+    }
+    tmp = str(final_path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(final_doc, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, final_path)
+
+    return model_id, content.strip() or "(empty reply)", elapsed, usage
 
 
 # ---------------------------------------------------------------------------
@@ -1315,16 +1443,68 @@ def main() -> int:
     print(f"🤖 Asking the crew ({len(jobs)} models{heretic_note}): {summary}\n")
 
     t0 = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_calls) as pool:
-        futures = [pool.submit(ask, e[0], prompt, base_url, key, MAIN_SYSTEM_PROMPT) for e, base_url, key in jobs]
-        heretic_future = None
-        if heretic_job:
-            entry, base_url, key = heretic_job
-            heretic_future = pool.submit(
-                ask, entry[0], prompt, base_url, key, HERETIC_SYSTEM_PROMPT
-            )
-        results = [f.result() for f in futures]
-        heretic_result = heretic_future.result() if heretic_future else None
+    stream_run_id = uuid.uuid4().hex[:12]
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=n_calls)
+
+    # Map future -> (model_id, role) so we can separate council from heretic
+    # even when they share the same model_id (Kimi K3 plays both roles).
+    future_roles: dict = {}
+    futures_list = []
+    for e, base_url, key in jobs:
+        f = pool.submit(
+            ask, e[0], prompt, base_url, key, MAIN_SYSTEM_PROMPT,
+            "council", stream_run_id,
+        )
+        future_roles[f] = (e[0], "council")
+        futures_list.append(f)
+    heretic_future = None
+    if heretic_job:
+        entry, base_url, key = heretic_job
+        heretic_future = pool.submit(
+            ask, entry[0], prompt, base_url, key, HERETIC_SYSTEM_PROMPT,
+            "heretic", stream_run_id,
+        )
+        future_roles[heretic_future] = (entry[0], "heretic")
+
+    # Quorum-based return: collect completed results until deadline.
+    # Stragglers keep streaming to disk; their checkpoints are NOT lost.
+    deadline = t0 + QUORUM_DEADLINE
+    council_results: list = []
+    heretic_result = None
+    timed_out_models: list = []
+    pending = set(future_roles.keys())
+
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        finished, pending = concurrent.futures.wait(
+            pending,
+            timeout=min(remaining, 30),
+            return_when=concurrent.futures.FIRST_COMPLETED,
+        )
+        for fut in finished:
+            mid, role = future_roles[fut]
+            try:
+                result = fut.result()
+            except Exception as exc:
+                result = (mid, f"ERROR: future failure: {exc}", 0.0, {})
+            if role == "heretic":
+                heretic_result = result
+            else:
+                council_results.append(result)
+
+    # Collect timed-out models
+    for fut in pending:
+        mid, role = future_roles[fut]
+        if role == "council":
+            timed_out_models.append(mid)
+    heretic_timed_out = (
+        heretic_future is not None and heretic_future in pending
+    )
+
+    # Try to cancel stragglers so they don't block process exit
+    pool.shutdown(wait=False, cancel_futures=True)
 
     wall_seconds = time.monotonic() - t0
 
@@ -1333,7 +1513,7 @@ def main() -> int:
     ledger_responses = []
     has_error = False
 
-    for mid, content, dt, usage in sorted(results, key=lambda r: order[r[0]]):
+    for mid, content, dt, usage in sorted(council_results, key=lambda r: order[r[0]]):
         entry = next((e for e in CREW if e[0] == mid), None)
         label = entry[1] if entry else mid
         in_tok = usage["prompt_tokens"]
@@ -1356,6 +1536,26 @@ def main() -> int:
             "cost": cost,
             "elapsed_seconds": dt,
             "error": content if content.startswith("ERROR:") else None,
+        })
+
+    # Report timed-out models
+    for mid in timed_out_models:
+        entry = next((e for e in CREW if e[0] == mid), None)
+        label = entry[1] if entry else mid
+        slug = _model_slug(mid)
+        ckpt_path = _checkpoint_root() / stream_run_id / f"council_{slug}.jsonl"
+        print(f"── {label} ({mid}) — TIMED OUT (partial checkpoint: {ckpt_path}) ──")
+        print()
+        has_error = True
+        ledger_responses.append({
+            "model_id": mid,
+            "role": "council",
+            "text": "(timed out — partial transcript on disk)",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cost": 0,
+            "elapsed_seconds": QUORUM_DEADLINE,
+            "error": "timed out at quorum deadline",
         })
 
     # Heretic verdict comes LAST
