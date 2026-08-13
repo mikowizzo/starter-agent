@@ -10,6 +10,8 @@ Usage:
   python ask_crew.py --file path/to/code.py "review this"
   python ask_crew.py --file a.py --file b.py "compare these"
   python ask_crew.py --file README.md         # default: "please review"
+  python ask_crew.py --history                # show recent runs from the ledger
+  python ask_crew.py --history 20             # show last 20 runs
 
 Allowed --models ids (exact match; anything else is rejected with this list):
   hf:moonshotai/Kimi-K3    Kimi K3            (Synthetic)
@@ -21,25 +23,32 @@ Pass one or more --file PATH args to inline file contents into the prompt.
 Text files are inlined; binary files are noted but not inlined. Files larger
 than MAX_FILE_BYTES are truncated with a warning.
 
-Reads SYNTHETIC_API_KEY (Kimi K3) and OPENROUTER_API_KEY
-(Grok 4.6, Gemini 3.7 Flash) from the env.
-
 DESIGNATED HERETIC MODE (always on):
   Crew models tend to converge — overlapping training data means they can
   all be wrong the same way. To counter this, Kimi K3 (when included in the
-  run) makes a SECOND call as the "designated heretic": forced to assume
-  the consensus is wrong and argue the strongest objection. Kimi's regular
+  run) makes a SECOND call as the "designated heretic": forced to assume the
+  consensus is wrong and argue the strongest objection. Kimi's regular
   crew response is shown as usual; the heretic verdict appears last, after
   all regular responses, clearly marked. If Kimi is not in --models, the
   heretic is skipped silently.
+
+LEDGER:
+  Every run is persisted to a SQLite ledger (default: ~/.local/share/crew/
+  crew_ledger.db, or $CREW_LEDGER_DB). The ledger stores run metadata,
+  per-model responses, and the heretic verdict. Disable with CREW_LEDGER=off.
+
+Reads SYNTHETIC_API_KEY (Kimi K3) and OPENROUTER_API_KEY
+(Grok 4.6, Gemini 3.7 Flash) from the env.
 """
 import concurrent.futures
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 BASE_URL = "https://opencode.ai/zen/go/v1/chat/completions"
@@ -84,24 +93,186 @@ HERETIC_SYSTEM_PROMPT = (
 )
 
 
+# ---------------------------------------------------------------------------
+# SQLite Ledger
+#
+# Lean schema, versioned via PRAGMA user_version for clean migrations. Money
+# stored as integer micro-USD (avoids float-rounding bugs). Heretic is a
+# response with role='heretic', not special columns. FTS5 virtual tables
+# power search (future: Claim Cartography). No speculative columns for
+# Elo/claims — those land as migrations when the features are built.
+# ---------------------------------------------------------------------------
+
+SCHEMA_VERSION = 1
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS runs (
+    run_id            TEXT PRIMARY KEY,
+    ts                INTEGER NOT NULL,             -- unix epoch seconds (UTC)
+    cwd               TEXT,
+    query             TEXT NOT NULL,
+    files_json        TEXT NOT NULL DEFAULT '[]',   -- JSON array of paths
+    config_json       TEXT NOT NULL DEFAULT '{}',   -- model list, params (NO credentials)
+    total_cost_micros INTEGER,                      -- NULL if unknown
+    wall_seconds      REAL,
+    status            TEXT NOT NULL DEFAULT 'ok'
+                      CHECK (status IN ('ok','partial','error'))
+);
+
+CREATE TABLE IF NOT EXISTS responses (
+    response_id       INTEGER PRIMARY KEY AUTOINCREMENT,  -- stable FK for Elo/votes/claims
+    run_id            TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    model_id          TEXT NOT NULL,
+    role              TEXT NOT NULL DEFAULT 'council'
+                      CHECK (role IN ('council','heretic')),
+    response_text     TEXT,                           -- NULL on provider error
+    prompt_tokens     INTEGER,                        -- nullable: not every provider reports
+    completion_tokens INTEGER,
+    cost_micros       INTEGER,                        -- snapshot at write time
+    elapsed_seconds   REAL,
+    error             TEXT                            -- non-NULL if this model failed
+);
+CREATE INDEX IF NOT EXISTS idx_responses_run   ON responses(run_id);
+CREATE INDEX IF NOT EXISTS idx_responses_model ON responses(model_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_runs_ts         ON runs(ts);
+
+-- Full-text search on queries and responses (future: topic search, Claim Cartography)
+CREATE VIRTUAL TABLE IF NOT EXISTS runs_fts USING fts5(
+    query, content='runs', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS runs_ai AFTER INSERT ON runs BEGIN
+    INSERT INTO runs_fts(rowid, query) VALUES (new.rowid, new.query);
+END;
+"""
+
+_LEDGER_DISABLED = False  # sticky: one write failure disables writes for the process
+
+
+def _default_db_path() -> str:
+    """Resolve the ledger path. CREW_LEDGER_DB env overrides the default."""
+    if p := os.environ.get("CREW_LEDGER_DB"):
+        return p
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "crew", "crew_ledger.db")
+
+
+def _ledger_enabled() -> bool:
+    return os.environ.get("CREW_LEDGER", "on").lower() not in ("off", "0", "false")
+
+
+def _open_ledger(path: str | None = None) -> sqlite3.Connection:
+    """Open (and migrate if needed) the ledger DB. Can raise — caller handles."""
+    path = path or _default_db_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        conn.executescript(SCHEMA_SQL)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    return conn
+
+
+def _usd_to_micros(usd: float | None) -> int | None:
+    return None if usd is None else int(round(usd * 1_000_000))
+
+
+def record_run(
+    query: str,
+    files: list[str],
+    models_asked: list[str],
+    responses: list[dict],
+    wall_seconds: float,
+    status: str = "ok",
+) -> str | None:
+    """Persist one invocation to the ledger. Returns run_id, or None on failure.
+
+    Never raises — a ledger failure must not kill the main ask flow. On first
+    failure, writes are sticky-disabled for the rest of the process and a
+    WARNING is printed to stderr (loud once, then silent).
+    """
+    global _LEDGER_DISABLED
+    if _LEDGER_DISABLED or not _ledger_enabled():
+        return None
+    try:
+        conn = _open_ledger()
+        run_id = uuid.uuid4().hex
+        total = sum(r.get("cost", 0) for r in responses if r.get("cost") is not None)
+        config = {"models": models_asked}  # no credentials, ever
+        with conn:  # single transaction: run row + all response rows
+            conn.execute(
+                "INSERT INTO runs(run_id, ts, cwd, query, files_json, "
+                "config_json, total_cost_micros, wall_seconds, status) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (run_id, int(time.time()), os.getcwd(), query,
+                 json.dumps(files), json.dumps(config),
+                 _usd_to_micros(total), wall_seconds, status),
+            )
+            conn.executemany(
+                "INSERT INTO responses(run_id, model_id, role, response_text, "
+                "prompt_tokens, completion_tokens, cost_micros, "
+                "elapsed_seconds, error) VALUES (?,?,?,?,?,?,?,?,?)",
+                [(run_id, r["model_id"], r.get("role", "council"),
+                  r.get("text"), r.get("prompt_tokens"),
+                  r.get("completion_tokens"), _usd_to_micros(r.get("cost")),
+                  r.get("elapsed_seconds"), r.get("error"))
+                 for r in responses],
+            )
+        conn.close()
+        return run_id
+    except Exception as e:
+        _LEDGER_DISABLED = True
+        print(f"[ledger] WARNING: write failed — ledger disabled for this "
+              f"process: {e}", file=sys.stderr)
+        return None
+
+
+def cmd_history(limit: int = 10) -> int:
+    """Print recent runs from the ledger."""
+    try:
+        conn = _open_ledger()
+    except Exception as e:
+        print(f"[ledger] ERROR: cannot open ledger ({e})", file=sys.stderr)
+        return 1
+    rows = conn.execute(
+        "SELECT run_id, ts, query, total_cost_micros, status, wall_seconds, "
+        "(SELECT group_concat(model_id || "
+        "  CASE role WHEN 'heretic' THEN '*' ELSE '' END, ', ') "
+        "  FROM responses WHERE run_id = runs.run_id) AS models "
+        "FROM runs ORDER BY ts DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    if not rows:
+        note = " (ledger writes may have failed recently)" if _LEDGER_DISABLED else ""
+        print(f"No runs recorded yet.{note}")
+        return 0
+    print(f"{'ID':<10} {'TIMESTAMP':<18} {'COST':>10}  {'MODELS':<40} QUERY")
+    print("-" * 110)
+    for r in rows:
+        cost = "?" if r["total_cost_micros"] is None else f"${r['total_cost_micros']/1e6:.4f}"
+        ts_str = time.strftime("%Y-%m-%d %H:%M", time.gmtime(r["ts"]))
+        q = " ".join(r["query"].split())[:50]
+        print(f"{r['run_id'][:8]:<10} {ts_str:<18} {cost:>10}  "
+              f"[{r['models'] or ''}]  {q}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Core ask-crew logic
+# ---------------------------------------------------------------------------
 
 def route(entry: tuple) -> tuple[str, str]:
     """(full endpoint url, api_key_env) for a crew entry; default = OpenCode."""
     if len(entry) >= 4:
         base, key_env = entry[2], entry[3]
-        # entry base_url is a bare base (e.g. .../v1) — append the completions path.
         url = base if base.endswith("/chat/completions") else base.rstrip("/") + "/chat/completions"
         return url, key_env
     return BASE_URL, KEY_ENV
 
 TIMEOUT = 600  # 10 min per model — long enough for complex queries
-# Per-file inlining cap. Large files blow the context window; truncate with a
-# marker so the model still sees the structure.
 MAX_FILE_BYTES = 100_000
-# Rough chars-per-token for the cache-hint estimate. Display-only; the real
-# prefix size is whatever the provider's tokenizer produces.
 CHARS_PER_TOKEN = 4
-# Cloudflare 403s Python-urllib's default UA (error 1010) — browser UA required.
 HEADERS = {
     "Authorization": "Bearer {key}",
     "Content-Type": "application/json",
@@ -139,18 +310,9 @@ def _stable_path_key(path: str) -> str:
 
 
 def read_file_block(path: str) -> str | None:
-    """Read a file and return a prompt-ready block, or None if unusable.
-
-    - Text files are inlined, truncated at MAX_FILE_BYTES with a marker.
-    - Binary files (not valid UTF-8) return a one-line note (caller still
-      includes the file in the prompt so the model sees it was provided).
-    - Missing / unreadable / not-a-file paths return None — caller warns
-      and skips them so a single bad path doesn't abort the whole run.
-    """
+    """Read a file and return a prompt-ready block, or None if unusable."""
     p = Path(path)
     if not p.is_file():
-        # Fall back to the workspace root — the script may run from a
-        # different cwd than the caller (e.g. invoked via skill tools).
         alt = Path("/workspace") / path
         if alt.is_file():
             p = alt
@@ -163,16 +325,13 @@ def read_file_block(path: str) -> str | None:
     except OSError as e:
         print(f"WARNING: cannot read {path}: {e}", file=sys.stderr)
         return None
-
     truncated = len(raw) > MAX_FILE_BYTES
     if truncated:
         raw = raw[:MAX_FILE_BYTES]
-
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return f"--- file: {path} ({size} bytes; binary, not inlined) ---\n--- end {path} ---"
-
     suffix = (
         f"\n... [truncated: kept first {MAX_FILE_BYTES} of {size} bytes]"
         if truncated
@@ -184,20 +343,10 @@ def read_file_block(path: str) -> str | None:
 def build_prompt(query: str, files: list[str]) -> str:
     """Combine inlined file blocks with the user's question into one prompt.
 
-    If ``query`` is empty and at least one file was inlined, defaults to
-    "Please review the file(s) above." so file-only invocations work.
-
-    Prompt-cache hygiene: file blocks are emitted in a deterministic order
-    (sorted by a stable sha256 of the path), independent of CLI arg order.
-    Provider KV-cache reuse keys on an identical prompt prefix, so
-    "--file a.py --file b.py" and "--file b.py --file a.py" now produce the
-    SAME prefix and hit the cache on repeat runs. File contents themselves
-    are untouched — only the block order changes. The question always comes
-    last so the entire file section remains a cacheable static prefix.
+    File blocks are emitted in deterministic order (sorted by stable sha256
+    of the path) so provider KV-cache reuse engages on repeat runs.
     """
     blocks: list[str] = []
-    # Sort BEFORE reading so even unreadable files can't perturb the order
-    # of the survivors (they're skipped with a warning downstream).
     for path in sorted(files, key=_stable_path_key):
         block = read_file_block(path)
         if block is None:
@@ -225,13 +374,7 @@ def ask(
     key: str,
     system: str | None = None,
 ) -> tuple[str, str, float, dict]:
-    """Ask one model, return (model_id, content_or_error, elapsed_seconds, usage).
-
-    ``system``, if given, is prepended as a system message (used by the
-    designated-heretic call). ``usage`` is {"prompt_tokens": int,
-    "completion_tokens": int} extracted from the response's ``usage`` block
-    (defaults to zeros on error/missing).
-    """
+    """Ask one model, return (model_id, content_or_error, elapsed_seconds, usage)."""
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -260,11 +403,16 @@ def ask(
         return model_id, f"ERROR: {type(e).__name__}: {e}", time.monotonic() - t0, {"prompt_tokens": 0, "completion_tokens": 0}
 
 
-def parse_args(argv: list[str]) -> tuple[list[str], list[str], str]:
-    """Parse CLI into (models, files, query). Query may be empty (file-only)."""
+def parse_args(argv: list[str]) -> tuple[list[str], list[str], str, bool, int]:
+    """Parse CLI into (models, files, query, history_flag, history_limit).
+
+    --history [N]  shows recent runs from the ledger and exits.
+    """
     models: list[str] = [e[0] for e in CREW]
     files: list[str] = []
     rest: list[str] = []
+    history = False
+    history_limit = 10
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -280,11 +428,19 @@ def parse_args(argv: list[str]) -> tuple[list[str], list[str], str]:
                 sys.exit(2)
             files.append(argv[i + 1])
             i += 2
+        elif a == "--history":
+            history = True
+            # Optional numeric arg: --history 20
+            if i + 1 < len(argv) and argv[i + 1].isdigit():
+                history_limit = int(argv[i + 1])
+                i += 2
+            else:
+                i += 1
         else:
             rest.append(a)
             i += 1
     query = " ".join(rest).strip()
-    return models, files, query
+    return models, files, query, history, history_limit
 
 
 def _cost(entry: tuple | None, usage: dict) -> float:
@@ -298,11 +454,17 @@ def _cost(entry: tuple | None, usage: dict) -> float:
 
 
 def main() -> int:
-    models, files, query = parse_args(sys.argv[1:])
+    models, files, query, history, history_limit = parse_args(sys.argv[1:])
+
+    # --history: read-only ledger view, then exit
+    if history:
+        return cmd_history(history_limit)
+
     if not query and not files:
         print(__doc__)
         return 2
-    jobs = []  # (entry, base_url, key)
+
+    jobs = []
     for mid in models:
         entry = next((e for e in CREW if e[0] == mid), None)
         if entry is None:
@@ -321,13 +483,11 @@ def main() -> int:
         jobs.append((entry, base_url, key))
 
     prompt = build_prompt(query, files)
-    # Show a short summary, not the full inlined prompt (which may be huge).
     summary = query or "(no question — file review only)"
     if files:
         summary += f"  [files: {', '.join(files)}]"
 
-    # Heretic job: only fires if Kimi K3 is in this run's model list; it
-    # launches in the SAME pool at the SAME time as the regular crew calls.
+    # Heretic job: only fires if Kimi K3 is in this run's model list
     heretic_job = next(
         (j for j in jobs if j[0][0] == HERETIC_MODEL_ID), None
     )
@@ -335,6 +495,7 @@ def main() -> int:
     heretic_note = " + 🎭 heretic" if heretic_job else ""
     print(f"🤖 Asking the crew ({len(jobs)} models{heretic_note}): {summary}\n")
 
+    t0 = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_calls) as pool:
         futures = [pool.submit(ask, e[0], prompt, base_url, key) for e, base_url, key in jobs]
         heretic_future = None
@@ -346,8 +507,13 @@ def main() -> int:
         results = [f.result() for f in futures]
         heretic_result = heretic_future.result() if heretic_future else None
 
+    wall_seconds = time.monotonic() - t0
+
     order = {e[0][0]: i for i, e in enumerate(jobs)}
     total_cost = 0.0
+    ledger_responses = []
+    has_error = False
+
     for mid, content, dt, usage in sorted(results, key=lambda r: order[r[0]]):
         entry = next((e for e in CREW if e[0] == mid), None)
         label = entry[1] if entry else mid
@@ -355,12 +521,25 @@ def main() -> int:
         out_tok = usage["completion_tokens"]
         cost = _cost(entry, usage)
         total_cost += cost
+        if content.startswith("ERROR:"):
+            has_error = True
         print(f"── {label} ({mid}) — {dt:.1f}s · {in_tok:,}→{out_tok:,} tok · ${cost:.4f} ──")
         print(content)
         print()
 
-    # Heretic verdict comes LAST, after all regular crew responses, with a
-    # distinct separator style so it can't be mistaken for a crew answer.
+        # Collect for ledger
+        ledger_responses.append({
+            "model_id": mid,
+            "role": "council",
+            "text": content,
+            "prompt_tokens": in_tok,
+            "completion_tokens": out_tok,
+            "cost": cost,
+            "elapsed_seconds": dt,
+            "error": content if content.startswith("ERROR:") else None,
+        })
+
+    # Heretic verdict comes LAST
     if heretic_result:
         mid, content, dt, usage = heretic_result
         entry = next((e for e in CREW if e[0] == mid), None)
@@ -377,7 +556,29 @@ def main() -> int:
         print(content)
         print()
 
+        ledger_responses.append({
+            "model_id": mid,
+            "role": "heretic",
+            "text": content,
+            "prompt_tokens": in_tok,
+            "completion_tokens": out_tok,
+            "cost": cost,
+            "elapsed_seconds": dt,
+            "error": None,
+        })
+
     print(f"💰 Total crew cost: ${total_cost:.4f}")
+
+    # Persist to ledger (never crashes the main flow)
+    status = "partial" if has_error else "ok"
+    record_run(
+        query=query,
+        files=files,
+        models_asked=[e[0][0] for e, _, _ in jobs],
+        responses=ledger_responses,
+        wall_seconds=wall_seconds,
+        status=status,
+    )
     return 0
 
 
