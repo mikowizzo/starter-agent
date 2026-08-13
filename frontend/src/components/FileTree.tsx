@@ -9,6 +9,7 @@ import {
   FolderPlus,
   Trash2,
   Pencil,
+  Download,
 } from "lucide-react";
 import type { TreeNode, FileKind } from "../lib/filesApi";
 
@@ -214,6 +215,22 @@ export function FileTree({
           <FolderPlus className="h-3.5 w-3.5" />
         </button>
         <div className="flex-1" />
+        <button
+          title="Download"
+          disabled={!selectedPath}
+          onClick={() => {
+            if (!selectedPath) return;
+            const a = document.createElement("a");
+            a.href = `/api/files/raw?path=${encodeURIComponent(selectedPath)}&download=1`;
+            a.download = selectedPath.split("/").pop() || "download";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+          }}
+          className="rounded p-1 text-[var(--color-dim)] transition hover:bg-[var(--color-border)] hover:text-[var(--color-accent)] disabled:opacity-30"
+        >
+          <Download className="h-3.5 w-3.5" />
+        </button>
         <button
           title="Rename"
           disabled={!selectedPath}
