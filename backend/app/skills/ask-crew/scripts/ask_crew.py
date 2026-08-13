@@ -187,7 +187,7 @@ END;
 SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS claims (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    response_id       INTEGER REFERENCES responses(response_id),
+    response_id       INTEGER,                          -- nullable: may not be in ledger
     run_id            TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     model_id          TEXT NOT NULL,
     role              TEXT NOT NULL DEFAULT 'council',
@@ -483,8 +483,14 @@ _CLAIM_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 _PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+_CLAIM_STOPWORDS = frozenset(
+    "the a an and or but if then that this is are was were be been it its of to "
+    "in for on with as at by from can could should would may might will per "
+    "not no very more much when while does do did has have had than also into"
+    .split()
+)
 
-CLAIM_SIMILARITY_THRESHOLD = 0.5
+CLAIM_SIMILARITY_THRESHOLD = 0.35
 
 
 def extract_claims_tagged(text: str, role: str) -> list[tuple[str, str]]:
@@ -513,8 +519,13 @@ def extract_claims_tagged(text: str, role: str) -> list[tuple[str, str]]:
 
 
 def normalize_claim(text: str) -> str:
-    """Lowercase, strip punctuation, collapse whitespace — comparison only."""
-    return " ".join(text.lower().translate(_PUNCT_TABLE).split())
+    """Lowercase, strip punctuation, remove stopwords, collapse whitespace.
+
+    Used only for clustering comparison — the original verbatim text is
+    always preserved for display.
+    """
+    tokens = text.lower().translate(_PUNCT_TABLE).split()
+    return " ".join(t for t in tokens if t not in _CLAIM_STOPWORDS)
 
 
 def _similarity(tokens_a: set, tokens_b: set) -> float:
@@ -880,7 +891,7 @@ def main() -> int:
         try:
             conn = _open_ledger()
             resp_rows = conn.execute(
-                "SELECT response_id, model_id, role FROM responses WHERE run_id = ? ORDER BY id",
+                "SELECT response_id, model_id, role FROM responses WHERE run_id = ? ORDER BY response_id",
                 (run_id,),
             ).fetchall()
             conn.close()
