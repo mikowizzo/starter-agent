@@ -1296,7 +1296,8 @@ def parse_args(argv: list[str]) -> dict:
       --file PATH         inline a file into the prompt (repeatable)
       --history [N]       show recent runs and exit
       --no-claims         skip claim cartography
-      --judge             run blind arena after crew answers (adds judge calls)
+      --no-judge          skip blind arena judging (judging is ON by default)
+      --judge             force judging on (default behaviour, no need to pass)
       --judge-swap        double-judge each pair to catch position bias
       --elo [CAT]         print Elo leaderboard and exit
       --elo-rebuild       replay match history to rebuild ratings, then exit
@@ -1309,7 +1310,7 @@ def parse_args(argv: list[str]) -> dict:
         "history": False,
         "history_limit": 10,
         "no_claims": False,
-        "judge": False,
+        "judge": True,        # judging on by default — closes the learning loop
         "judge_swap": False,
         "elo": False,
         "elo_category": "*",
@@ -1341,6 +1342,9 @@ def parse_args(argv: list[str]) -> dict:
                 i += 1
         elif a == "--no-claims":
             opts["no_claims"] = True
+            i += 1
+        elif a == "--no-judge":
+            opts["judge"] = False
             i += 1
         elif a == "--judge":
             opts["judge"] = True
@@ -1627,7 +1631,7 @@ def main() -> int:
         if len(ok_results) >= 2:
             run_claim_cartography(ok_results, run_id, crew_count)
 
-    # Blind Arena + Elo: optional, flag-gated. Fires after all other features.
+    # Blind Arena + Elo: ON by default (close the learning loop).
     # Uses the same response_ids enriched above for FK integrity.
     if opts["judge"] and run_id:
         # Build arena responses (council only — heretic excluded)
