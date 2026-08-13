@@ -23,6 +23,15 @@ than MAX_FILE_BYTES are truncated with a warning.
 
 Reads SYNTHETIC_API_KEY (Kimi K3) and OPENROUTER_API_KEY
 (Grok 4.6, Gemini 3.7 Flash) from the env.
+
+DESIGNATED HERETIC MODE (always on):
+  Crew models tend to converge — overlapping training data means they can
+  all be wrong the same way. To counter this, Kimi K3 (when included in the
+  run) makes a SECOND call as the "designated heretic": forced to assume
+  the consensus is wrong and argue the strongest objection. Kimi's regular
+  crew response is shown as usual; the heretic verdict appears last, after
+  all regular responses, clearly marked. If Kimi is not in --models, the
+  heretic is skipped silently.
 """
 import concurrent.futures
 import hashlib
@@ -52,6 +61,27 @@ CREW = [
      "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
      0.75, 3.75),
 ]
+
+# Designated heretic — hardcoded, always Kimi K3. Inspired by intelligence
+# analysis's "tenth man rule": when everyone agrees, someone is assigned to
+# assume the agreement is wrong. Kimi still answers normally as part of the
+# crew; this is an ADDITIONAL adversarial call on the same prompt.
+HERETIC_MODEL_ID = "hf:moonshotai/Kimi-K3"
+HERETIC_SYSTEM_PROMPT = (
+    "You are the DESIGNATED HERETIC on a panel of AI models answering the "
+    "same question. The other models will likely converge on a consensus "
+    "answer — and that consensus may be wrong.\n"
+    "Your job:\n"
+    "- Assume the obvious/consensus answer is WRONG or incomplete.\n"
+    "- Construct the strongest possible objection to it (steelman the "
+    "opposing view).\n"
+    "- Hunt for what the others will miss: edge cases, security issues, "
+    "false assumptions, logical fallacies, hidden costs, and failure modes.\n"
+    "- Be adversarial but constructive: every objection should point toward "
+    "a better answer, not just tear things down.\n"
+    "Do NOT hedge or summarize both sides. Commit to the strongest "
+    "counter-argument."
+)
 
 
 
@@ -188,15 +218,25 @@ def build_prompt(query: str, files: list[str]) -> str:
     return query
 
 
-def ask(model_id: str, query: str, base_url: str, key: str) -> tuple[str, str, float, dict]:
+def ask(
+    model_id: str,
+    query: str,
+    base_url: str,
+    key: str,
+    system: str | None = None,
+) -> tuple[str, str, float, dict]:
     """Ask one model, return (model_id, content_or_error, elapsed_seconds, usage).
 
-    ``usage`` is {"prompt_tokens": int, "completion_tokens": int} extracted
-    from the response's ``usage`` block (defaults to zeros on error/missing).
+    ``system``, if given, is prepended as a system message (used by the
+    designated-heretic call). ``usage`` is {"prompt_tokens": int,
+    "completion_tokens": int} extracted from the response's ``usage`` block
+    (defaults to zeros on error/missing).
     """
-    body = json.dumps(
-        {"model": model_id, "messages": [{"role": "user", "content": query}]}
-    ).encode()
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": query})
+    body = json.dumps({"model": model_id, "messages": messages}).encode()
     req = urllib.request.Request(
         base_url,
         data=body,
@@ -247,6 +287,16 @@ def parse_args(argv: list[str]) -> tuple[list[str], list[str], str]:
     return models, files, query
 
 
+def _cost(entry: tuple | None, usage: dict) -> float:
+    """Dollar cost of one call from token counts + per-model pricing (per 1M)."""
+    in_price = entry[4] if entry and len(entry) >= 6 else 0.0
+    out_price = entry[5] if entry and len(entry) >= 6 else 0.0
+    return (
+        usage["prompt_tokens"] * in_price / 1_000_000
+        + usage["completion_tokens"] * out_price / 1_000_000
+    )
+
+
 def main() -> int:
     models, files, query = parse_args(sys.argv[1:])
     if not query and not files:
@@ -275,10 +325,26 @@ def main() -> int:
     summary = query or "(no question — file review only)"
     if files:
         summary += f"  [files: {', '.join(files)}]"
-    print(f"🤖 Asking the crew ({len(jobs)} models): {summary}\n")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+
+    # Heretic job: only fires if Kimi K3 is in this run's model list; it
+    # launches in the SAME pool at the SAME time as the regular crew calls.
+    heretic_job = next(
+        (j for j in jobs if j[0][0] == HERETIC_MODEL_ID), None
+    )
+    n_calls = len(jobs) + (1 if heretic_job else 0)
+    heretic_note = " + 🎭 heretic" if heretic_job else ""
+    print(f"🤖 Asking the crew ({len(jobs)} models{heretic_note}): {summary}\n")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_calls) as pool:
         futures = [pool.submit(ask, e[0], prompt, base_url, key) for e, base_url, key in jobs]
+        heretic_future = None
+        if heretic_job:
+            entry, base_url, key = heretic_job
+            heretic_future = pool.submit(
+                ask, entry[0], prompt, base_url, key, HERETIC_SYSTEM_PROMPT
+            )
         results = [f.result() for f in futures]
+        heretic_result = heretic_future.result() if heretic_future else None
 
     order = {e[0][0]: i for i, e in enumerate(jobs)}
     total_cost = 0.0
@@ -287,14 +353,30 @@ def main() -> int:
         label = entry[1] if entry else mid
         in_tok = usage["prompt_tokens"]
         out_tok = usage["completion_tokens"]
-        # Calculate cost from token counts + per-model pricing (per 1M tokens)
-        in_price = entry[4] if entry and len(entry) >= 6 else 0.0
-        out_price = entry[5] if entry and len(entry) >= 6 else 0.0
-        cost = in_tok * in_price / 1_000_000 + out_tok * out_price / 1_000_000
+        cost = _cost(entry, usage)
         total_cost += cost
         print(f"── {label} ({mid}) — {dt:.1f}s · {in_tok:,}→{out_tok:,} tok · ${cost:.4f} ──")
         print(content)
         print()
+
+    # Heretic verdict comes LAST, after all regular crew responses, with a
+    # distinct separator style so it can't be mistaken for a crew answer.
+    if heretic_result:
+        mid, content, dt, usage = heretic_result
+        entry = next((e for e in CREW if e[0] == mid), None)
+        in_tok = usage["prompt_tokens"]
+        out_tok = usage["completion_tokens"]
+        cost = _cost(entry, usage)
+        total_cost += cost
+        print("═" * 72)
+        print(
+            f"🎭 HERETIC (Kimi K3) — designated devil's advocate "
+            f"— {dt:.1f}s · {in_tok:,}→{out_tok:,} tok · ${cost:.4f}"
+        )
+        print("═" * 72)
+        print(content)
+        print()
+
     print(f"💰 Total crew cost: ${total_cost:.4f}")
     return 0
 
