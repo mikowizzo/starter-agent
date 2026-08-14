@@ -603,30 +603,41 @@ class CloneTools(Toolkit):
     async def stop_clone(self, name: str) -> str:
         """Stop a clone's containers (keeps code and data)."""
         name = name.strip().lower()
-        registry = self._load_registry()
-        if not any(c["name"] == name for c in registry):
+        if not any(c["name"] == name for c in self._load_registry()):
             return f"Error: Clone '{name}' not found."
-        result = await self._compose_cmd(name, "stop")
-        if result.returncode != 0:
-            return f"Error: Failed to stop: {result.stderr[-300:]}"
-        for c in registry:
-            if c["name"] == name:
-                c["status"] = "stopped"
-        self._save_registry(registry)
+        # The lock spans the compose command AND the registry write. Unlocked,
+        # a stop racing a start double-SIGTERMed a freshly started backend,
+        # and unsynchronised load-modify-save cycles silently lost status
+        # updates (registry said "stopped" while containers ran, hiding
+        # clones from the switcher).
+        async with self._lock:
+            result = await self._compose_cmd(name, "stop")
+            if result.returncode != 0:
+                return f"Error: Failed to stop: {result.stderr[-300:]}"
+            registry = self._load_registry()
+            for c in registry:
+                if c["name"] == name:
+                    c["status"] = "stopped"
+            self._save_registry(registry)
         return f"Clone '{name}' stopped."
 
     async def start_clone(self, name: str) -> str:
         """Start a previously stopped clone."""
         name = name.strip().lower()
-        registry = self._load_registry()
-        clone = next((c for c in registry if c["name"] == name), None)
-        if not clone:
+        if not any(c["name"] == name for c in self._load_registry()):
             return f"Error: Clone '{name}' not found."
-        result = await self._compose_cmd(name, "start")
-        if result.returncode != 0:
-            return f"Error: Failed to start: {result.stderr[-300:]}"
-        clone["status"] = "running"
-        self._save_registry(registry)
+        # Same lock discipline as stop_clone: start must never interleave
+        # with a stop, and the registry write must be read-modify-write
+        # under the lock or concurrent updates get lost.
+        async with self._lock:
+            result = await self._compose_cmd(name, "start")
+            if result.returncode != 0:
+                return f"Error: Failed to start: {result.stderr[-300:]}"
+            registry = self._load_registry()
+            for c in registry:
+                if c["name"] == name:
+                    c["status"] = "running"
+            self._save_registry(registry)
         return f"Clone '{name}' started."
 
     async def rebuild_clone(self, name: str) -> str:
@@ -636,15 +647,20 @@ class CloneTools(Toolkit):
         requirements.txt) — docker compose start does NOT.
         """
         name = name.strip().lower()
-        registry = self._load_registry()
-        clone = next((c for c in registry if c["name"] == name), None)
-        if not clone:
+        if not any(c["name"] == name for c in self._load_registry()):
             return f"Error: Clone '{name}' not found."
-        result = await self._compose_cmd(name, "up", "--build", "-d", timeout=300)
-        if result.returncode != 0:
-            return f"Error: Rebuild failed: {result.stderr[-300:]}"
-        clone["status"] = "running"
-        self._save_registry(registry)
+        # Lock held across the (slow) rebuild too — a rebuild racing a
+        # stop/start is the same interleaving hazard, and clone ops are rare
+        # enough that serialising them is cheaper than debugging the races.
+        async with self._lock:
+            result = await self._compose_cmd(name, "up", "--build", "-d", timeout=300)
+            if result.returncode != 0:
+                return f"Error: Rebuild failed: {result.stderr[-300:]}"
+            registry = self._load_registry()
+            for c in registry:
+                if c["name"] == name:
+                    c["status"] = "running"
+            self._save_registry(registry)
         return f"Clone '{name}' rebuilt and restarted."
 
 
@@ -691,14 +707,19 @@ class CloneTools(Toolkit):
 
         if down_ok and not sweep_errors:
             # Clean teardown — remove from registry and delete dir
-            registry = [c for c in registry if c["name"] != name]
-            self._save_registry(registry)
+            async with self._lock:
+                registry = [c for c in self._load_registry() if c["name"] != name]
+                self._save_registry(registry)
             shutil.rmtree(clone_dir, ignore_errors=True)
             return f"Clone '{name}' destroyed."
         elif errors:
             # Partial failure — mark as zombie, keep registry entry for GC retry
-            clone["status"] = "zombie"
-            self._save_registry(registry)
+            async with self._lock:
+                registry = self._load_registry()
+                for c in registry:
+                    if c["name"] == name:
+                        c["status"] = "zombie"
+                self._save_registry(registry)
             shutil.rmtree(clone_dir, ignore_errors=True)
             return (
                 f"Clone '{name}' partially destroyed — marked as zombie. "
@@ -706,8 +727,9 @@ class CloneTools(Toolkit):
             )
         else:
             # compose down said success but sweep found leftovers
-            registry = [c for c in registry if c["name"] != name]
-            self._save_registry(registry)
+            async with self._lock:
+                registry = [c for c in self._load_registry() if c["name"] != name]
+                self._save_registry(registry)
             shutil.rmtree(clone_dir, ignore_errors=True)
             return f"Clone '{name}' destroyed."
 

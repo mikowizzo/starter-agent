@@ -88,6 +88,46 @@ def _own_frontend_port() -> int:
     return 3000
 
 
+def _reconcile_clone_status(clones: list) -> list:
+    """Self-heal clone statuses against Docker's live state.
+
+    Registry writes can be lost (crashed backend mid-write, manual edits,
+    historical races) leaving e.g. "stopped" for containers that actually
+    run — which hides clones from the bottombar switcher. One `docker ps`
+    gives the truth: a clone is running iff its compose project has any
+    running container. Mismatches are fixed in the registry so the file
+    converges to reality too. Docker failures are non-fatal — registry
+    values pass through untouched.
+    """
+    try:
+        r = subprocess.run(
+            ["docker", "ps", "--format",
+             "{{.Label \"com.docker.compose.project\"}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            return clones
+        running_projects = {p.strip() for p in r.stdout.splitlines() if p.strip()}
+    except Exception:
+        return clones
+
+    changed = False
+    for c in clones:
+        live = "running" if c.get("name") in running_projects else "stopped"
+        if c.get("status") != live:
+            c["status"] = live
+            changed = True
+
+    if changed:
+        try:
+            reg = Path("/workspace/.clones/registry.json")
+            reg.parent.mkdir(parents=True, exist_ok=True)
+            reg.write_text(json.dumps(clones, indent=2))
+        except Exception:
+            pass  # Report the live view regardless; persisting is best-effort
+    return clones
+
+
 @router.get("/clones")
 async def get_clones(request: Request):
     """This instance's frontend port plus all registered clones — powers the
@@ -102,7 +142,7 @@ async def get_clones(request: Request):
         try:
             data = json.loads(reg.read_text())
             if isinstance(data, list):
-                clones = data
+                clones = _reconcile_clone_status(data)
         except Exception:
             pass
 

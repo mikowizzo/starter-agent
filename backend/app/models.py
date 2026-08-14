@@ -47,14 +47,17 @@ MODELS = {
         "max_tokens": 65536,
         "supports_images": False,
     },
-    "glm_52": {
-        "id": "GLM-5.2",
-        "name": "GLM 5.2",
+    "glm_53": {
+        "id": "GLM-5.3",
+        "name": "GLM 5.3",
         "provider": "ZAI",
         "base_url": "https://api.z.ai/api/coding/paas/v4",
         "api_key_env": "ZAI_API_KEY",
         "max_tokens": 65536,
         "supports_images": False,
+        # Z.AI thinking control — GLM 5.3 supports {type, level}
+        # where level ∈ {low, medium, high}. Default is medium.
+        "thinking": {"type": "enabled", "level": "high"},
     },
     "minimax_m3": {
         "id": "minimax-m3",
@@ -91,14 +94,16 @@ def make_model(model_key: str) -> OpenAILike:
     """Construct a model instance from a MODELS key."""
     info = MODELS[model_key]
     cls = TextOnlyOpenAILike if not info.get("supports_images", False) else OpenAILike
+    extra_body = info.get("thinking") or None
     return cls(
         id=info["id"],
         api_key=os.environ.get(info.get("api_key_env", API_KEY_ENV)),
         base_url=info.get("base_url", BASE_URL),
         max_tokens=info["max_tokens"],
+        extra_body=extra_body,
     )
 
 
 def primary_model() -> OpenAILike:
-    """Default model — GLM 5.2."""
-    return make_model("glm_52")
+    """Default model — GLM 5.3."""
+    return make_model("glm_53")
