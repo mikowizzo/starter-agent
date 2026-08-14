@@ -63,3 +63,47 @@ export function updateActiveRunEventIndex(index: number) {
     // ignore
   }
 }
+
+// ── Stopping markers (Stop button — cancel is cooperative server-side) ──
+
+const STOPPING_KEY = "stopping_run_ids";
+
+/** Track runs the user asked to stop. agno's cancel is cooperative: the run
+ *  winds down at the next checkpoint (between model calls / tool completions),
+ *  so it can linger in /runs/active for a while. The pill shows "stopping…"
+ *  for these instead of implying the run is still wanted. */
+export function markRunStopping(runId: string) {
+  try {
+    const ids: string[] = JSON.parse(localStorage.getItem(STOPPING_KEY) || "[]");
+    const next = ids.filter(
+      (id) => id !== runId && typeof id === "string" && id.length > 0,
+    );
+    next.push(runId);
+    localStorage.setItem(STOPPING_KEY, JSON.stringify(next));
+  } catch {
+    localStorage.setItem(STOPPING_KEY, JSON.stringify([runId]));
+  }
+}
+
+export function isRunStopping(runId: string): boolean {
+  try {
+    const ids: string[] = JSON.parse(localStorage.getItem(STOPPING_KEY) || "[]");
+    return Array.isArray(ids) && ids.includes(runId);
+  } catch {
+    return false;
+  }
+}
+
+/** Drop stopping-markers for runs no longer active (called when the active
+ *  list refreshes) so the marker store doesn't grow unbounded. */
+export function pruneStoppingRuns(activeRunIds: string[]) {
+  try {
+    const ids: string[] = JSON.parse(localStorage.getItem(STOPPING_KEY) || "[]");
+    const kept = ids.filter((id) => activeRunIds.includes(id));
+    if (kept.length !== ids.length) {
+      localStorage.setItem(STOPPING_KEY, JSON.stringify(kept));
+    }
+  } catch {
+    // ignore
+  }
+}

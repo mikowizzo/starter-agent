@@ -5,7 +5,6 @@ import { ModelSelector } from "./ModelSelector";
 import {
   fetchModel,
   fetchClones,
-  fetchCloneRunCounts,
   fetchQuota,
   fetchSyntheticQuota,
   type CloneInfo,
@@ -228,7 +227,7 @@ export function BottomBar({
           >
             {runs.length > 0 ? (
               <span className="relative flex h-2 w-2">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--color-accent)] opacity-75"></span>
+                <span className="absolute inline-flex h-2 w-2 rounded-full bg-[var(--color-accent)] animate-glow-pulse"></span>
                 <span className="relative inline-flex h-2 w-2 rounded-full bg-[var(--color-accent)]"></span>
               </span>
             ) : (

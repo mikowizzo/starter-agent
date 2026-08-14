@@ -23,6 +23,7 @@ export default defineConfig({
     proxy: {
       "/health": { target: "http://backend:8000" },
       "/sessions": { target: "http://backend:8000" },
+      "/runs": { target: "http://backend:8000" },
       "/agents": sseProxy,
       "/teams": sseProxy,
       "/settings": { target: "http://backend:8000" },

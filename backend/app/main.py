@@ -15,7 +15,7 @@ from app.config import (
 )
 from app.db import init_attachment_tables
 from app.agents.coordinator import build_team
-from app.routers import sessions, settings, convert, attachments, providers, files
+from app.routers import sessions, settings, convert, attachments, providers, files, runs
 
 validate_env()
 
@@ -39,6 +39,7 @@ app.state.team = team
 
 # Include custom routers (sessions override Agno's defaults via first-match)
 app.include_router(sessions.router)
+app.include_router(runs.router)
 app.include_router(settings.router)
 app.include_router(convert.router)
 app.include_router(attachments.router)

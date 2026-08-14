@@ -18,6 +18,7 @@ import {
   getActiveRun,
   setActiveRun,
   setAgnoSessionId,
+  markRunStopping,
 } from "../lib/session";
 import type { ActiveRun } from "../lib/session";
 import { runBase } from "../lib/api";
@@ -218,17 +219,32 @@ export function useAgentStream() {
 
   const stopRun = useCallback(async () => {
     abortRef.current?.abort();
-    const runId = activeRunIdRef.current;
+    // The ref can be null after a watchdog-reconnect failure cleared it —
+    // fall back to the persisted run so we still cancel server-side.
+    const runId = activeRunIdRef.current ?? getActiveRun()?.runId ?? null;
     clearRun();
     setLoading(false);
 
     if (runId) {
+      // Cancel is cooperative server-side — mark it so the runs pill shows
+      // "stopping…" (not a live run) while it winds down.
+      markRunStopping(runId);
       const params = new URLSearchParams();
       if (sessionIdRef.current) params.set("session_id", sessionIdRef.current);
-      fetch(
-        `${runBase()}/runs/${runId}/cancel${params.toString() ? `?${params}` : ""}`,
-        { method: "POST" },
-      ).catch(() => {});
+      const url = `${runBase()}/runs/${runId}/cancel${params.toString() ? `?${params}` : ""}`;
+      try {
+        const res = await fetch(url, { method: "POST" });
+        if (!res.ok) {
+          // One retry — the backend may briefly be restarting.
+          await new Promise((r) => setTimeout(r, 800));
+          await fetch(url, { method: "POST" });
+        }
+      } catch (err) {
+        // Never silent: a dropped cancel strands a background run.
+        console.error("[stopRun] failed to cancel run", runId, err);
+      }
+    } else {
+      console.warn("[stopRun] no runId known — run (if any) continues server-side");
     }
   }, [clearRun]);
 
@@ -439,6 +455,37 @@ export function useAgentStream() {
     setMessages,
   ]);
 
+  // ── Reconnect to a remote (background) run ─────────────
+
+  const reconnectToRun = useCallback(
+    async (run: {
+      run_id: string;
+      session_id: string | null;
+      input_preview: string | null;
+    }) => {
+      // Drop any local stream — we're switching to the run's session.
+      abortRef.current?.abort();
+      activeRunIdRef.current = null;
+      clearRun();
+      setLoading(false);
+
+      // Seed the persisted run state so reconnect()/resumeWithRetry see it.
+      // lastEventIndex -1 = replay everything still buffered server-side,
+      // which fills the fresh assistant bubble with the run's output so far.
+      updateActiveRun({
+        runId: run.run_id,
+        sessionId: run.session_id ?? "",
+        lastEventIndex: -1,
+        userMessage: run.input_preview || "(background run)",
+        createdAt: Date.now(),
+      });
+      if (run.session_id) updateSessionId(run.session_id);
+
+      await reconnect();
+    },
+    [reconnect, clearRun, updateActiveRun, updateSessionId],
+  );
+
   useEffect(() => {
     const saved = getActiveRun();
     if (saved && saved.runId) {
@@ -455,5 +502,6 @@ export function useAgentStream() {
     activeRun,
     sessionId,
     setSessionId: updateSessionId,
+    reconnectToRun,
   };
 }

@@ -54,6 +54,23 @@ body {
 }
 
 
+@keyframes glow-pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+/* Opacity-only pulse ring — avoids WebKit compositing glitches that
+   animate-ping (transform+opacity) can cause inside absolutely-positioned
+   popovers ("half-dark card" rendering bugs). */
+.animate-glow-pulse {
+  animation: glow-pulse 1.6s ease-in-out infinite;
+}
+
 @keyframes fade-in {
   from {
     opacity: 0;

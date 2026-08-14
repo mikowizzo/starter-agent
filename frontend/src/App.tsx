@@ -10,7 +10,8 @@ import {
   isActive,
 } from "./components/MessageBubble";
 import { useAgentStream } from "./hooks/useAgentStream";
-import { loadSessionHistory, fetchTeamId } from "./lib/api";
+import { useActiveRuns } from "./hooks/useActiveRuns";
+import { loadSessionHistory, fetchTeamId, type ActiveRunInfo } from "./lib/api";
 
 // ── Backend-ready gate ──────────────────────────────────────────────
 // Polls /health until the backend responds, then renders the app.
@@ -75,7 +76,13 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
     activeRun,
     sessionId,
     setSessionId,
+    reconnectToRun,
   } = stream;
+  // Poll for background runs + per-clone run counts only when not streaming
+  // locally — avoids double-indicators while a stream is already on screen.
+  const { runs: backgroundRuns, cloneCounts } = useActiveRuns(
+    loading || !!activeRun,
+  );
   const [filesOpen, setFilesOpen] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -173,6 +180,15 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
     })();
   }
 
+  // Reconnect to a background run from the active-runs pill: switch to its
+  // session first (loads history), then hand off to the streaming hook which
+  // seeds the run state and calls the resume endpoint.
+  function handleReconnectRun(run: ActiveRunInfo) {
+    if (!run.session_id) return;
+    if (run.session_id !== sessionId) loadSession(run.session_id);
+    reconnectToRun(run);
+  }
+
   // ── Derived state ─────────────────────────────────────────────────
 
   const visibleMessages = messages.filter(isVisible);
@@ -232,7 +248,7 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
             {showScrollBtn && (
               <button
                 onClick={() => scrollToBottom(true)}
-                className="absolute bottom-4 left-1/2 z-10 flex h-9 w-9 -translate-x-1/2 items-center justify-center rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-dim)] shadow-lg transition-colors hover:text-[var(--color-accent)]"
+                className="absolute bottom-4 left-1/2 z-10 flex h-9 w-9 -translate-x-1/2 items-center justify-center rounded-full border border-[var(--color-border)] bg-[var(--color-panel)] text-[var(--color-dim)] shadow-lg transition-colors hover:text-[var(--color-accent)]"
                 aria-label="Scroll to bottom"
               >
                 <ChevronDown className="h-5 w-5" />
@@ -253,6 +269,9 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
               currentSessionId={sessionId}
               onSelectSession={loadSession}
               onOpenFiles={() => setFilesOpen(true)}
+              activeRuns={backgroundRuns}
+              cloneCounts={cloneCounts}
+              onReconnectRun={handleReconnectRun}
             />
           </div>
       </div>
