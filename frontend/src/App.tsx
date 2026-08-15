@@ -11,7 +11,8 @@ import {
 } from "./components/MessageBubble";
 import { useAgentStream } from "./hooks/useAgentStream";
 import { useActiveRuns } from "./hooks/useActiveRuns";
-import { loadSessionHistory, fetchTeamId, type ActiveRunInfo } from "./lib/api";
+import { loadSessionHistory, fetchTeamId } from "./lib/api";
+import { isRunStopping } from "./lib/session";
 
 // ── Backend-ready gate ──────────────────────────────────────────────
 // Polls /health until the backend responds, then renders the app.
@@ -99,6 +100,49 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
   const hasActiveRunRef = useRef(hasActiveRun);
   hasActiveRunRef.current = hasActiveRun;
 
+  // ── Auto-attach on load ────────────────────────────────────────
+  // One run per agent now: if a live run is executing server-side and
+  // we're idle, attach to it automatically instead of waiting for a
+  // click. Guards against two races:
+  //   - the poll list can be ~5s stale right after OUR run completes →
+  //     never auto-attach to a run this tab watched to completion;
+  //   - a run belonging to another session would yank the user out of
+  //     the conversation they're reading → only attach in-place (same
+  //     session or nothing on screen).
+  // One attempt per run id — a failed attach falls back to the pill's
+  // manual Reconnect rather than retry-looping.
+  const autoAttachedRef = useRef<Set<string>>(new Set());
+  const watchedRunRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (activeRun?.runId) {
+      watchedRunRef.current = activeRun.runId;
+    } else if (watchedRunRef.current) {
+      // Run we were watching just ended — mark as seen.
+      autoAttachedRef.current.add(watchedRunRef.current);
+      watchedRunRef.current = null;
+    }
+  }, [activeRun]);
+
+  useEffect(() => {
+    if (loadingHistory || loading || activeRun) return;
+    const target = backgroundRuns.find(
+      (r) =>
+        r.live &&
+        r.session_id &&
+        !isRunStopping(r.run_id) &&
+        !autoAttachedRef.current.has(r.run_id) &&
+        // In-place only: same session, or nothing on screen to yank.
+        (!sessionId || r.session_id === sessionId),
+    );
+    if (!target) return;
+    autoAttachedRef.current.add(target.run_id);
+    // Attach: switch to the run's session (loads history), then hand off to
+    // the streaming hook which seeds the run state and calls the resume endpoint.
+    if (target.session_id !== sessionId) loadSession(target.session_id);
+    reconnectToRun(target);
+  }, [backgroundRuns, loading, activeRun, loadingHistory, sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Init ──────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -178,15 +222,6 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
         if (gen === loadIdRef.current) setLoadingHistory(false);
       }
     })();
-  }
-
-  // Reconnect to a background run from the active-runs pill: switch to its
-  // session first (loads history), then hand off to the streaming hook which
-  // seeds the run state and calls the resume endpoint.
-  function handleReconnectRun(run: ActiveRunInfo) {
-    if (!run.session_id) return;
-    if (run.session_id !== sessionId) loadSession(run.session_id);
-    reconnectToRun(run);
   }
 
   // ── Derived state ─────────────────────────────────────────────────
@@ -270,8 +305,8 @@ function AppContent({ stream }: { stream: ReturnType<typeof useAgentStream> }) {
               onSelectSession={loadSession}
               onOpenFiles={() => setFilesOpen(true)}
               activeRuns={backgroundRuns}
+              liveNow={hasActiveRun}
               cloneCounts={cloneCounts}
-              onReconnectRun={handleReconnectRun}
             />
           </div>
       </div>

@@ -19,6 +19,7 @@ import {
   setActiveRun,
   setAgnoSessionId,
   markRunStopping,
+  isRunStopping,
 } from "../lib/session";
 import type { ActiveRun } from "../lib/session";
 import { runBase } from "../lib/api";
@@ -355,11 +356,48 @@ export function useAgentStream() {
         // SSE connection drops (browser refresh), and can be resumed.
         form.append("background", "true");
 
-        const res = await fetch(`${runBase()}/runs`, {
+        let res = await fetch(`${runBase()}/runs`, {
           method: "POST",
           body: form,
           signal: ac.signal,
         });
+
+        // ── 409: one-run-per-agent guard ──────────────────────────
+        // A live run already exists. Attach to it instead of failing —
+        // unless it's one this browser asked to stop (cancel is
+        // cooperative); then give it a moment to wind down and retry.
+        let attached = false;
+        for (let attempt = 0; res.status === 409 && attempt < 3; attempt++) {
+          const body = await res.json().catch(() => null);
+          const active = body?.active_run as
+            | {
+                run_id: string;
+                session_id: string | null;
+                input_preview: string | null;
+              }
+            | undefined;
+          if (active?.run_id && !isRunStopping(active.run_id)) {
+            // Drop the optimistic bubbles — this message was never sent.
+            setMessages((prev) =>
+              prev.filter((m) => m.id !== userMsg.id && m.id !== assistantId),
+            );
+            await reconnectToRunRef.current(active);
+            attached = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 2000));
+          if (ac.signal.aborted) break;
+          res = await fetch(`${runBase()}/runs`, {
+            method: "POST",
+            body: form,
+            signal: ac.signal,
+          });
+        }
+        if (attached) return;
+        if (res.status === 409) {
+          fail("The previous run is still winding down — try again in a few seconds.");
+          return;
+        }
 
         if (!res.ok) {
           updateAssistant(assistantId, {
@@ -458,11 +496,7 @@ export function useAgentStream() {
   // ── Reconnect to a remote (background) run ─────────────
 
   const reconnectToRun = useCallback(
-    async (run: {
-      run_id: string;
-      session_id: string | null;
-      input_preview: string | null;
-    }) => {
+    async (run: { run_id: string; session_id: string | null; input_preview: string | null }) => {
       // Drop any local stream — we're switching to the run's session.
       abortRef.current?.abort();
       activeRunIdRef.current = null;
@@ -485,6 +519,11 @@ export function useAgentStream() {
     },
     [reconnect, clearRun, updateActiveRun, updateSessionId],
   );
+
+  // Late-bound: send() attaches to the active run on 409 but is defined
+  // before reconnectToRun — resolve through a ref instead of reordering.
+  const reconnectToRunRef = useRef(reconnectToRun);
+  reconnectToRunRef.current = reconnectToRun;
 
   useEffect(() => {
     const saved = getActiveRun();

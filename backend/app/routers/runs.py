@@ -132,31 +132,61 @@ def _recent_db_runs() -> tuple[dict[str, dict], set[str]]:
     return running, terminal
 
 
-@router.get("/runs/active")
-def list_active_runs():
-    """All runs currently executing (or that look like it), newest first."""
-    active: list[dict] = []
-    now = time.time()
-    db_running, db_terminal = _recent_db_runs()
+# ── Shared cache for the DB scan ────────────────────────────────────
+# Both /runs/active (5s poll) and the one-run-per-agent guard hit the
+# same scan; a 2s memo dedupes bursts without ever serving stale data
+# across poll cycles.
 
-    # ── 1. Live runs this process is streaming (true source) ────────
+_RECENT_CACHE_SECONDS = 2.0
+_recent_ts = 0.0
+_recent_cache: tuple[dict[str, dict], set[str]] | None = None
+
+
+def _recent_db_runs_cached() -> tuple[dict[str, dict], set[str]]:
+    global _recent_ts, _recent_cache
+    if _recent_cache is not None and time.monotonic() - _recent_ts < _RECENT_CACHE_SECONDS:
+        return _recent_cache
+    result = _recent_db_runs()
+    _recent_ts = time.monotonic()
+    _recent_cache = result
+    return result
+
+
+def _live_runs() -> list[dict]:
+    """Genuinely executing runs, newest first — the resumable set.
+
+    A run is live when the event buffer is still streaming it (fresh
+    RUNNING status) AND the DB has no terminal record for it (buffer
+    status never flips for team runs — see module docstring).
+
+    Fast path: with no fresh buffer candidates no DB scan happens at all
+    (the common case; the scan costs ~200ms on a large DB).
+    """
+    now = time.time()
+    candidates = []
     for run_id, meta in event_buffer.run_metadata.items():
         status = meta.get("status")
         status_val = status.value if hasattr(status, "value") else status
         if status_val != RunStatus.running.value:
             continue
-        if run_id in db_terminal:
-            continue  # ghost — DB says it finished
         last_updated = meta.get("last_updated")
         if last_updated and now - float(last_updated) > BUFFER_STALE_SECONDS:
-            continue  # ghost — silent for minutes, nothing is streaming
+            continue
+        candidates.append((run_id, meta))
+    if not candidates:
+        return []
 
+    db_running, db_terminal = _recent_db_runs_cached()
+    out: list[dict] = []
+    for run_id, meta in candidates:
+        if run_id in db_terminal:
+            continue  # ghost — DB says it finished
         db_info = db_running.get(run_id, {})
         events = event_buffer.events.get(run_id) or []
         session_id = db_info.get("session_id") or next(
             (getattr(ev, "session_id", None) for ev in events if getattr(ev, "session_id", None)), None
         )
-        active.append(
+        out.append(
             {
                 "run_id": run_id,
                 "session_id": session_id,
@@ -169,6 +199,16 @@ def list_active_runs():
                 "live": True,
             }
         )
+    out.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    return out
+
+
+@router.get("/runs/active")
+def list_active_runs():
+    """All runs currently executing (or that look like it), newest first."""
+    active: list[dict] = _live_runs()
+    now = time.time()
+    db_running, db_terminal = _recent_db_runs_cached()
 
     seen = {r["run_id"] for r in active}
 
@@ -203,6 +243,20 @@ def list_active_runs():
 
     active.sort(key=lambda r: r.get("created_at") or "", reverse=True)
     return JSONResponse({"data": active})
+
+
+# ── One-run-per-agent guard ─────────────────────────────────────────
+#
+# Enforced by middleware in main.py on POST /teams/{id}/runs: if a run
+# is genuinely executing, new runs are refused with 409 + the active
+# run's info so the UI can attach to it instead. Only LIVE runs block
+# (orphans died with a restart; stopping runs clear within seconds as
+# the DB flips to terminal).
+
+async def get_blocking_run() -> dict | None:
+    """The newest live run, or None. Called before creating any new run."""
+    runs = await asyncio.to_thread(_live_runs)
+    return runs[0] if runs else None
 
 
 # ── Clone run counts ────────────────────────────────────────────────

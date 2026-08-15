@@ -4,6 +4,8 @@ Thin bootstrap: patches, env validation, team construction, router wiring.
 All route logic lives in app/routers/.
 """
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
 from agno.db.sqlite import SqliteDb
 from agno.os import AgentOS
 
@@ -36,6 +38,47 @@ app = AgentOS(
 
 # Make team available to routers via app.state
 app.state.team = team
+
+
+# ── One-run-per-agent guard ─────────────────────────────────────────
+# A single agent instance runs one user-facing run at a time. New runs
+# are refused with 409 + the active run's info so the UI can attach to
+# the existing run instead of spawning a parallel one. Only genuinely
+# LIVE runs block (see runs.get_blocking_run). Matches exactly the run
+# creation route (POST /teams/{id}/runs), not resume/cancel paths.
+
+
+# Compiled once: matches /teams/{id}/runs and /agents/{id}/runs (the two
+# run-creation routes this instance serves), with or without an /v1 prefix,
+# and NOT subpaths like .../runs/{run_id}/resume or .../runs/{id}/cancel.
+import re as _re
+
+_RUN_CREATE_RE = _re.compile(r"(?:/v1)?/(?:teams|agents)/[^/]+/runs/?$")
+
+
+@app.middleware("http")
+async def one_run_per_agent(request: Request, call_next):
+    # agno's scheduler POSTs scheduled runs to itself over loopback — those
+    # are machine-initiated and must never be blocked by a live user run.
+    if (
+        request.method == "POST"
+        and not (
+            request.client and request.client.host in ("127.0.0.1", "::1")
+        )
+        and _RUN_CREATE_RE.fullmatch(request.url.path)
+    ):
+        blocking = await runs.get_blocking_run()
+        if blocking:
+            # JSONResponse, not HTTPException — raised inside middleware an
+            # HTTPException would bypass FastAPI's handlers and surface as 500.
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "message": "An active run is already executing for this agent",
+                    "active_run": blocking,
+                },
+            )
+    return await call_next(request)
 
 # Include custom routers (sessions override Agno's defaults via first-match)
 app.include_router(sessions.router)

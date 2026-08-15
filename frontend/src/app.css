@@ -57,18 +57,37 @@ body {
 @keyframes glow-pulse {
   0%,
   100% {
-    opacity: 0.25;
+    opacity: 0.2;
+    transform: scale(1);
   }
   50% {
-    opacity: 0.85;
+    opacity: 0.8;
+    transform: scale(1.5);
   }
 }
 
-/* Opacity-only pulse ring — avoids WebKit compositing glitches that
-   animate-ping (transform+opacity) can cause inside absolutely-positioned
-   popovers ("half-dark card" rendering bugs). */
+@keyframes dot-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 1px 1px color-mix(in srgb, var(--glow-color) 45%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 3px 1px color-mix(in srgb, var(--glow-color) 60%, transparent),
+      0 0 8px 2px color-mix(in srgb, var(--glow-color) 25%, transparent);
+  }
+}
+
+/* Pulsing status dot: expanding halo ring + breathing glow on the core.
+   The halo animates transform+opacity but never overlaps other content
+   (overflow-safe, pointer-events-none parent), so no WebKit compositing
+   issues with cards. box-shadow glow uses no transform at all. */
 .animate-glow-pulse {
-  animation: glow-pulse 1.6s ease-in-out infinite;
+  animation: glow-pulse 1.8s ease-in-out infinite;
+}
+
+.animate-dot-glow {
+  animation: dot-breathe 1.8s ease-in-out infinite;
 }
 
 @keyframes fade-in {
