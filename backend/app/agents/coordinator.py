@@ -80,6 +80,7 @@ def build_team(
         "ARTEFACT DOWNLOAD LINKS (2026-08-11): Whenever generating any downloadable artefact (HTML, CSV, JSON, images, etc.), always provide a direct download link using the Tailscale IP and this agent's backend port (3001 for the main agent): http://100.102.77.20:3001/api/files/raw?path=<workspace-relative-path>. Never use 127.0.0.1 or localhost. Provide the link immediately after creating the artefact.",
         "ASK-CREW TIMEOUT (2026-08-11): When invoking the ask-crew skill via get_skill_script, ALWAYS pass timeout=600 (10 min). The script's internal HTTP TIMEOUT is also 600. Never use the default 30s or try iteratively increasing — it wastes time. Just pass timeout=600 from the start.",
         "SKILL TOOL TIMEOUTS (2026-08-11): The timeout parameter ONLY exists on get_skill_script, and ONLY matters when execute=True. get_skill_instructions and get_skill_reference have NO timeout parameter (they just read files from disk — instant). get_skill_script with execute=False also ignores timeout (just reading content). Only pass timeout on get_skill_script calls where execute=True. Do NOT pass timeout to get_skill_instructions or get_skill_reference — it is meaningless there.",
+        "LARGE-FILE EDITS (2026-08-15): read the exact region fresh before every edit; apply ONE edit per call with exact anchors (beware lines beginning with quote characters — they poison the anchor match); atomic multi-edits fail wholesale on invisible whitespace mismatches.",
     ]
 
     # ── Team ──────────────────────────────────────────────────────────
