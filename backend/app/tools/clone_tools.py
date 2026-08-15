@@ -753,6 +753,38 @@ class CloneTools(Toolkit):
         """
         registry = self._load_registry()
         registry_names = {c["name"] for c in registry}
+
+        # --- 1.5 Union with other agents' registries (delegated clones) ---
+        # A clone may be parented to another agent (e.g. icio's crew): it is
+        # tracked in THAT agent's registry, not ours. Sweep only what no
+        # registry anywhere tracks, so delegated clones are never orphans.
+        try:
+            r = await asyncio.to_thread(
+                subprocess.run,
+                ["docker", "ps", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=15,
+            )
+            self_backend = f"{os.environ.get('CLONE_NAME', 'repo')}-backend-1"
+            other_backends = [
+                n.strip() for n in r.stdout.splitlines()
+                if n.strip().endswith("-backend-1") and n.strip() != self_backend
+            ]
+            for cname in other_backends:
+                try:
+                    rr = await asyncio.to_thread(
+                        subprocess.run,
+                        ["docker", "exec", cname, "cat",
+                         "/workspace/.clones/registry.json"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    for c in json.loads(rr.stdout or "[]"):
+                        if isinstance(c, dict) and c.get("name"):
+                            registry_names.add(c["name"])
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
         removed: list[str] = []
 
         # --- 1. Retry zombie clones ---
