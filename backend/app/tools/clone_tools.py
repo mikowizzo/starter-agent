@@ -174,11 +174,48 @@ class CloneTools(Toolkit):
             return True
 
     @staticmethod
-    def _next_ports(registry: list[dict]) -> tuple[int, int]:
-        b, f = _BASE_PORT_BACKEND, _BASE_PORT_FRONTEND
-        if registry:
-            b = max(c["ports"]["backend"] for c in registry) + 1
-            f = max(c["ports"]["frontend"] for c in registry) + 1
+    async def _next_ports(registry: list[dict]) -> tuple[int, int]:
+        """Pick the next free port pair for a new clone.
+
+        Scans EVERY agent's clone registry (not just ours) so ports never
+        collide with clones parented to other agents (e.g. sanji under nami,
+        icio's crew) — even when those clones are currently stopped, which
+        a live port-bind probe alone would miss.
+        """
+        # Union ports from every running agent's registry
+        all_b = {c["ports"]["backend"] for c in registry}
+        all_f = {c["ports"]["frontend"] for c in registry}
+        try:
+            r = await asyncio.to_thread(
+                subprocess.run,
+                ["docker", "ps", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=15,
+            )
+            self_backend = f"{os.environ.get('CLONE_NAME', 'repo')}-backend-1"
+            for cname in (n.strip() for n in r.stdout.splitlines()):
+                if not cname.endswith("-backend-1") or cname == self_backend:
+                    continue
+                try:
+                    rr = await asyncio.to_thread(
+                        subprocess.run,
+                        ["docker", "exec", cname, "cat",
+                         "/workspace/.clones/registry.json"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    for c in json.loads(rr.stdout or "[]"):
+                        if isinstance(c, dict):
+                            p = c.get("ports") or {}
+                            if p.get("backend"):
+                                all_b.add(p["backend"])
+                            if p.get("frontend"):
+                                all_f.add(p["frontend"])
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        b = max(all_b, default=_BASE_PORT_BACKEND - 1) + 1
+        f = max(all_f, default=_BASE_PORT_FRONTEND - 1) + 1
         # Advance past any ports already bound by running containers
         # (orphaned containers from a failed destroy, manual docker run, etc.)
         while CloneTools._port_in_use(b) or CloneTools._port_in_use(f):
@@ -387,7 +424,7 @@ class CloneTools(Toolkit):
             clone_dir = _CLONES_DIR / name
             if clone_dir.exists():
                 return f"Error: Directory {clone_dir} already exists."
-            port_b, port_f = self._next_ports(registry)
+            port_b, port_f = await self._next_ports(registry)
             # Pre-register as pending so concurrent calls get different ports
             registry.append({
                 "name": name,
