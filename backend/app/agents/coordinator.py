@@ -17,6 +17,7 @@ from app.models import primary_model
 from app.tools.attachment_tools import AttachmentTools
 from app.tools.code_tools import CodeTools
 from app.tools.clone_tools import CloneTools
+from app.tools.market_tools import MarketTools
 from app.tools.team_comms import TeamComms
 from agno.tools.scheduler import SchedulerTools
 
@@ -63,6 +64,9 @@ def build_team(
         base_dir=str(base_dir),
     )
 
+    # ── Market tools (Ticker X-Ray, from nami 2026-08-16) ──
+    market_tools = MarketTools()
+
     # Edit these instructions to define your agent's personality.
     # Each string is one instruction the agent follows.
     instructions = [
@@ -81,6 +85,7 @@ def build_team(
         "ASK-CREW TIMEOUT (2026-08-11): When invoking the ask-crew skill via get_skill_script, ALWAYS pass timeout=600 (10 min). The script's internal HTTP TIMEOUT is also 600. Never use the default 30s or try iteratively increasing — it wastes time. Just pass timeout=600 from the start.",
         "SKILL TOOL TIMEOUTS (2026-08-11): The timeout parameter ONLY exists on get_skill_script, and ONLY matters when execute=True. get_skill_instructions and get_skill_reference have NO timeout parameter (they just read files from disk — instant). get_skill_script with execute=False also ignores timeout (just reading content). Only pass timeout on get_skill_script calls where execute=True. Do NOT pass timeout to get_skill_instructions or get_skill_reference — it is meaningless there.",
         "LARGE-FILE EDITS (2026-08-15): read the exact region fresh before every edit; apply ONE edit per call with exact anchors (beware lines beginning with quote characters — they poison the anchor match); atomic multi-edits fail wholesale on invisible whitespace mismatches.",
+        "WORKSPACE HYGIENE (2026-08-16): Prevent clutter build-up. (1) All throwaway output (debug logs, curl responses, HTML dumps, scratch JSON) goes under scratch/ and gets deleted when the task ends — never leave *.out/*.log/tmp files lying around, and never create empty dirs. (2) Never duplicate a script or doc to make a variant (no *_v2/*_copy files) — edit the original in place and delete the old version when superseded. (3) After image-generation work, delete unused/orphaned outputs — keep only files actually referenced (e.g. avatar.jpg/png and named crew avatars in frontend/public/, not hashed leftovers in generated/). (4) Retire clones ONLY via destroy_clone, then confirm with list_clones — never rm -rf .clones/<name> by hand: root-owned files survive and leave zombie dirs that need sudo/docker to remove. (5) Before finishing any task that created or modified files, scan the workspace for leftovers (superseded drafts, one-off notes, regenerable working files) and clean them. When unsure whether something is still needed, ask the user before deleting.",
     ]
 
     # ── Team ──────────────────────────────────────────────────────────
@@ -106,6 +111,7 @@ def build_team(
         cache_session=True,
         tools=[
             code_tools,
+            market_tools,
             AttachmentTools(),
             CloneTools(team_name=team_name),
             TeamComms(),
