@@ -13,6 +13,8 @@ Usage:
   python ask_crew.py --history                # show recent runs from the ledger
   python ask_crew.py --history 20             # show last 20 runs
   python ask_crew.py --no-claims "quick question"  # skip claim cartography
+  python ask_crew.py --heretic "..."          # + designated-heretic pass (extra Kimi call)
+  python ask_crew.py --judge "..."            # + blind arena judging & Elo (extra calls)
 
 Allowed --models ids (exact match; anything else is rejected with this list):
   hf:moonshotai/Kimi-K3    Kimi K3            (Synthetic)
@@ -20,23 +22,32 @@ Allowed --models ids (exact match; anything else is rejected with this list):
   google/gemini-3.7-flash  Gemini 3.7 Flash   (OpenRouter)
   (default: all of the above)
 
-Pass one or more --file PATH args to inline file contents into the prompt.
-Text files are inlined; binary files are noted but not inlined. Files larger
-than MAX_FILE_BYTES are truncated with a warning.
+FILES (--file PATH, repeatable):
+  File contents are inlined into the prompt for every model. All inlined
+  files together must fit the per-RUN budget MAX_RUN_BYTES (300 KB ≈ 75k
+  tokens). Over budget → the run FAILS CLOSED with a per-file size report
+  (never a silent head-only review). Raise it with --max-bytes N — a single
+  large file then goes through whole — or opt into head-sampling every file
+  with --force-truncate (loud warnings; models will NOT see full files).
 
-DESIGNATED HERETIC MODE (always on):
+DESIGNATED HERETIC (opt-in: --heretic):
   Crew models tend to converge — overlapping training data means they can
-  all be wrong the same way. To counter this, Kimi K3 (when included in the
-  run) makes a SECOND call as the "designated heretic": forced to assume the
-  consensus is wrong and argue the strongest objection. Kimi's regular
-  crew response is shown as usual; the heretic verdict appears last, after
-  all regular responses, clearly marked. If Kimi is not in --models, the
-  heretic is skipped silently.
+  all be wrong the same way. With --heretic, Kimi K3 (when in --models)
+  makes a SECOND call as the "designated heretic": forced to assume the
+  consensus is wrong and argue the strongest objection. The verdict prints
+  last, clearly marked. Extra call = extra cost, hence opt-in.
+
+BLIND ARENA + ELO (opt-in: --judge):
+  After the crew answers, pairs are judged blind by a recused judge and Elo
+  ratings update in the ledger. --judge-swap double-judges each pair to
+  catch position bias. --elo [cat] shows the leaderboard, --elo-rebuild
+  replays history, --audit-bias prints the judge bias audit. Extra calls
+  cost money, hence opt-in.
 
 LEDGER:
-  Every run is persisted to a SQLite ledger (default: ~/.local/share/crew/
-  crew_ledger.db, or $CREW_LEDGER_DB). The ledger stores run metadata,
-  per-model responses, and the heretic verdict. Disable with CREW_LEDGER=off.
+  Every run is persisted to a SQLite ledger (default: <repo>/data/crew/
+  crew_ledger.db, or $CREW_LEDGER_DB). Stores run metadata, per-model
+  responses, claims, and match/Elo history. Disable with CREW_LEDGER=off.
 
 Reads SYNTHETIC_API_KEY (Kimi K3) and OPENROUTER_API_KEY
 (Grok 4.6, Gemini 3.7 Flash) from the env.
@@ -54,6 +65,7 @@ import string
 import sys
 import textwrap
 import time
+import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
@@ -161,9 +173,9 @@ HERETIC_SYSTEM_PROMPT = (
 #
 # Lean schema, versioned via PRAGMA user_version for clean migrations. Money
 # stored as integer micro-USD (avoids float-rounding bugs). Heretic is a
-# response with role='heretic', not special columns. FTS5 virtual tables
-# power search (future: Claim Cartography). No speculative columns for
-# Elo/claims — those land as migrations when the features are built.
+# response with role='heretic', not special columns. --history is a plain
+# ORDER BY ts DESC — no FTS5 (nothing ever queried it; dropped 2026-08-16,
+# existing DBs keep their harmless runs_fts table untouched).
 # ---------------------------------------------------------------------------
 
 SCHEMA_VERSION = 3
@@ -198,14 +210,6 @@ CREATE TABLE IF NOT EXISTS responses (
 CREATE INDEX IF NOT EXISTS idx_responses_run   ON responses(run_id);
 CREATE INDEX IF NOT EXISTS idx_responses_model ON responses(model_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_ts         ON runs(ts);
-
--- Full-text search on queries and responses (future: topic search, Claim Cartography)
-CREATE VIRTUAL TABLE IF NOT EXISTS runs_fts USING fts5(
-    query, content='runs', content_rowid='rowid'
-);
-CREATE TRIGGER IF NOT EXISTS runs_ai AFTER INSERT ON runs BEGIN
-    INSERT INTO runs_fts(rowid, query) VALUES (new.rowid, new.query);
-END;
 """
 
 SCHEMA_V3 = """
@@ -405,11 +409,39 @@ def route(entry: tuple) -> tuple[str, str]:
 
 # Streaming + checkpointing timeouts
 IDLE_TIMEOUT = 90        # max seconds of silence between SSE chunks (dead connection)
-FIRST_TOKEN_TIMEOUT = 180  # generous pre-first-token window (some models queue/think)
 WALL_CLOCK_CAP = 1200    # absolute per-stream cap (20 min) — ensures threads provably die
 QUORUM_DEADLINE = 510    # inner deadline (8.5 min) — returns before agent's 10-min kill
-MAX_FILE_BYTES = 100_000
+QUORUM_COUNT = 2         # return once this many council answers are in (or deadline)
+ASK_MAX_ATTEMPTS = 3     # 1 try + 2 retries, only BEFORE the first token arrives
+
+# HTTP statuses worth a retry (rate limits + transient server errors)
+_RETRYABLE_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _retryable(e: Exception) -> bool:
+    """Transient failure worth a retry? (HTTPError is a URLError subclass,
+    so it must be checked first.)"""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in _RETRYABLE_HTTP
+    return isinstance(
+        e, (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError)
+    )
+
+
+MAX_RUN_BYTES = 300_000  # per-RUN budget for all inlined files (~75k tokens) — fail closed
 CHARS_PER_TOKEN = 4
+
+# Capability routing: models differ in context size. A model whose context
+# is smaller than the prompt gets a structural summary (file tree + symbol
+# outline) instead of the full file bodies — not a silent head-only copy,
+# and no pre-splitting by the caller. Extend as crew models change.
+MODEL_CONTEXT_CHARS = {
+    "hf:moonshotai/Kimi-K3": 1_000_000 * CHARS_PER_TOKEN,
+    "x-ai/grok-4.6": 2_000_000 * CHARS_PER_TOKEN,
+    "google/gemini-3.7-flash": 1_000_000 * CHARS_PER_TOKEN,
+}
+OUTLINE_BUDGET = 30_000  # per-model cap for structural outlines (~7.5k tokens)
+
 HEADERS = {
     "Authorization": "Bearer {key}",
     "Content-Type": "application/json",
@@ -435,6 +467,37 @@ def get_env_key(name: str) -> str:
     return ""
 
 
+_DEF_RE = re.compile(
+    r"^(?:class|def|async\s+def|function|const|let|var|type|interface|enum|struct|impl|trait|pub\s+fn|fn)\b[^\n]*",
+    re.MULTILINE,
+)
+
+
+def file_outline(path: str, budget: int = OUTLINE_BUDGET) -> str:
+    """Structural summary of a source file: every def/class/declaration
+    line + key metadata, no bodies. Deterministic, local, zero API calls.
+    Used for capability routing when the full pack exceeds a model's
+    context."""
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"--- file: {path} (unreadable: {e}) ---"
+    lines = raw.splitlines()
+    hits = [
+        (i + 1, ln.rstrip())
+        for i, ln in enumerate(lines)
+        if _DEF_RE.match(ln)
+    ]
+    body = "\n".join(f"  L{i}: {ln}" for i, ln in hits)
+    if len(body) > budget:
+        body = body[:budget] + f"\n... ({len(hits)} symbols total, outline capped)"
+    return (
+        f"--- outline: {path} ({len(lines)} lines, {len(raw):,} bytes; "
+        f"structural summary — full file not inlined for this model) ---\n"
+        f"{body}\n--- end outline {path} ---"
+    )
+
+
 def _stable_path_key(path: str) -> str:
     """Deterministic sort key for a file path.
 
@@ -447,7 +510,12 @@ def _stable_path_key(path: str) -> str:
 
 
 def read_file_block(path: str) -> str | None:
-    """Read a file and return a prompt-ready block, or None if unusable."""
+    """Read a file and return a prompt-ready block, or None if unusable.
+
+    Reads the WHOLE file — no per-file cap. Oversize is enforced per-RUN in
+    build_prompt (fail closed), so a single big file goes through whole
+    when it's the only one.
+    """
     p = Path(path)
     if not p.is_file():
         alt = Path("/workspace") / path
@@ -457,51 +525,99 @@ def read_file_block(path: str) -> str | None:
             return None
     try:
         size = p.stat().st_size
-        with p.open("rb") as f:
-            raw = f.read(MAX_FILE_BYTES + 1)
+        raw = p.read_bytes()
     except OSError as e:
         print(f"WARNING: cannot read {path}: {e}", file=sys.stderr)
         return None
-    truncated = len(raw) > MAX_FILE_BYTES
-    if truncated:
-        raw = raw[:MAX_FILE_BYTES]
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return f"--- file: {path} ({size} bytes; binary, not inlined) ---\n--- end {path} ---"
-    suffix = (
-        f"\n... [truncated: kept first {MAX_FILE_BYTES} of {size} bytes]"
-        if truncated
-        else ""
-    )
-    return f"--- file: {path} ({size} bytes) ---\n{text}{suffix}\n--- end {path} ---"
+    return f"--- file: {path} ({size} bytes) ---\n{text}\n--- end {path} ---"
 
 
-def build_prompt(query: str, files: list[str]) -> str:
+def build_prompt(query: str, files: list[str], max_bytes: int = MAX_RUN_BYTES,
+                 force_truncate: bool = False) -> str:
     """Combine inlined file blocks with the user's question into one prompt.
 
     File blocks are emitted in deterministic order (sorted by stable sha256
     of the path) so provider KV-cache reuse engages on repeat runs.
+
+    Fail-closed per-RUN budget: if all inlined files together exceed
+    max_bytes, REFUSE (exit 2) with a per-file size report — never a
+    silent head-only review. --force-truncate opts into head-sampling
+    every file to fit the budget (loud warnings).
     """
-    blocks: list[str] = []
+    blocks: list[tuple[str, str, int]] = []  # (path, block, size_bytes)
     for path in sorted(files, key=_stable_path_key):
         block = read_file_block(path)
         if block is None:
             print(f"WARNING: file not found or not readable: {path}", file=sys.stderr)
             continue
-        blocks.append(block)
+        blocks.append((path, block, len(block.encode("utf-8"))))
     if not query and blocks:
         query = "Please review the file(s) above."
-    if blocks:
-        prefix_chars = sum(len(b) for b in blocks)
-        est_tokens = prefix_chars // CHARS_PER_TOKEN
+    if not blocks:
+        return query
+
+    total = sum(sz for _, _, sz in blocks)
+    if total > max_bytes:
+        if not force_truncate:
+            report = "\n".join(
+                f"  {sz:>9,}  {p}" for p, _, sz in sorted(
+                    blocks, key=lambda t: -t[2])
+            )
+            print(
+                f"ERROR: inlined files total {total:,} bytes but the per-run "
+                f"budget is {max_bytes:,} bytes (~{total // CHARS_PER_TOKEN:,} "
+                f"tokens would hit every model).\n"
+                f"Refusing to run a silent partial review. Options:\n"
+                f"  --max-bytes N     raise the budget (whole files, more cost)\n"
+                f"  --force-truncate  head-sample every file to fit (models "
+                f"will NOT see full files)\n"
+                f"Files by size:\n{report}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         print(
-            f"📎 Files sorted for cache reuse "
-            f"({len(blocks)} blocks, ~{est_tokens:,} tokens prefix)"
+            f"WARNING: --force-truncate — inlined files total {total:,} bytes, "
+            f"head-sampling every file to fit {max_bytes:,} bytes. "
+            f"Models will NOT see full files.",
+            file=sys.stderr,
         )
-        blocks.append(f"--- question ---\n{query}")
-        return "\n\n".join(blocks)
-    return query
+        # ponytail: equal share per file; a proportional allocator is
+        # overkill — tiny files keep everything, big ones get equal shares.
+        share = max_bytes // len(blocks)
+        kept: list[str] = []
+        for path, block, sz in blocks:
+            if sz <= share:
+                kept.append(block)
+                continue
+            b = block.encode("utf-8")[:share]
+            nl = b.rfind(b"\n")  # cut on a line boundary when cheap
+            if nl > share // 2:
+                b = b[:nl]
+            text = b.decode("utf-8", "replace")
+            kept.append(
+                f"--- file: {path} (TRUNCATED: kept first {len(b):,} of "
+                f"{sz:,} bytes) ---\n{text}\n--- end {path} ---"
+            )
+            print(
+                f"WARNING: truncated {path}: kept {len(b):,} of "
+                f"{sz:,} bytes",
+                file=sys.stderr,
+            )
+        rendered = kept
+    else:
+        rendered = [block for _, block, _ in blocks]
+
+    est_tokens = sum(len(b) for b in rendered) // CHARS_PER_TOKEN
+    print(
+        f"📎 Files sorted for cache reuse "
+        f"({len(rendered)} blocks, ~{est_tokens:,} tokens prefix)"
+    )
+    rendered.append(f"--- question ---\n{query}")
+    return "\n\n".join(rendered)
 
 
 def ask(
@@ -512,6 +628,7 @@ def ask(
     system: str | None = None,
     role_tag: str = "council",
     run_id: str | None = None,
+    attempt: int = 1,
 ) -> tuple[str, str, float, dict]:
     """Ask one model via SSE streaming with disk checkpointing.
 
@@ -605,6 +722,12 @@ def ask(
     except (socket.timeout, TimeoutError) as e:
         elapsed = time.monotonic() - t0
         kept = sum(len(p) for p in parts)
+        # Retry transient failures, but ONLY before any content arrived —
+        # past first token a retry would duplicate the checkpoint stream.
+        if not parts and attempt < ASK_MAX_ATTEMPTS and _retryable(e):
+            time.sleep(min(2 ** attempt, 8))  # 2s, 4s — capped, with backoff
+            return ask(model_id, query, base_url, key, system, role_tag,
+                       run_id, attempt + 1)
         return (
             model_id,
             f"ERROR: {type(e).__name__}: {e} "
@@ -615,6 +738,10 @@ def ask(
     except Exception as e:
         elapsed = time.monotonic() - t0
         kept = sum(len(p) for p in parts)
+        if not parts and attempt < ASK_MAX_ATTEMPTS and _retryable(e):
+            time.sleep(min(2 ** attempt, 8))
+            return ask(model_id, query, base_url, key, system, role_tag,
+                       run_id, attempt + 1)
         return (
             model_id,
             f"ERROR: {type(e).__name__}: {e} "
@@ -1261,33 +1388,6 @@ def audit_judge_bias(conn):
     print()
 
 
-def print_blind(responses):
-    """Anonymized crew output shown before judging."""
-    labels_list = list(string.ascii_uppercase)
-    mapping = {}
-    for i, r in enumerate(responses):
-        seat = labels_list[i]
-        mapping[r['model_id']] = seat
-        print(f'\n{"=" * 70}')
-        print(f'BLIND ARENA — Model {seat} (identity hidden)')
-        print('=' * 70)
-        print(r.get('answer_text') or f'[error: {r.get("error")}]')
-        print()
-    return mapping
-
-
-def print_reveal(mapping):
-    print(f'\n{"=" * 70}')
-    print('REVEAL')
-    print('=' * 70)
-    for model_id, seat in sorted(mapping.items(), key=lambda x: x[1]):
-        labels = {e[0]: e[1] for e in CREW}
-        lbl = labels.get(model_id, model_id)
-        print(f'  Model {seat} = {lbl}')
-    print()
-
-
-
 def parse_args(argv: list[str]) -> dict:
     """Parse CLI into a dict of options.
 
@@ -1296,12 +1396,14 @@ def parse_args(argv: list[str]) -> dict:
       --file PATH         inline a file into the prompt (repeatable)
       --history [N]       show recent runs and exit
       --no-claims         skip claim cartography
-      --no-judge          skip blind arena judging (judging is ON by default)
-      --judge             force judging on (default behaviour, no need to pass)
+      --heretic           add the designated-heretic pass (extra Kimi call)
+      --no-judge / --judge  blind arena judging is OFF unless --judge
       --judge-swap        double-judge each pair to catch position bias
       --elo [CAT]         print Elo leaderboard and exit
       --elo-rebuild       replay match history to rebuild ratings, then exit
       --audit-bias        print judge bias audit and exit
+      --max-bytes N       per-run budget for inlined files (default 300000)
+      --force-truncate    over budget? head-sample every file to fit (loud)
     """
     opts = {
         "models": [e[0] for e in CREW],
@@ -1310,12 +1412,15 @@ def parse_args(argv: list[str]) -> dict:
         "history": False,
         "history_limit": 10,
         "no_claims": False,
-        "judge": True,        # judging on by default — closes the learning loop
+        "heretic": False,
+        "judge": False,       # opt-in — extra calls cost money
         "judge_swap": False,
         "elo": False,
         "elo_category": "*",
         "elo_rebuild": False,
         "audit_bias": False,
+        "max_bytes": MAX_RUN_BYTES,
+        "force_truncate": False,
     }
     rest: list[str] = []
     i = 0
@@ -1343,6 +1448,9 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--no-claims":
             opts["no_claims"] = True
             i += 1
+        elif a == "--heretic":
+            opts["heretic"] = True
+            i += 1
         elif a == "--no-judge":
             opts["judge"] = False
             i += 1
@@ -1365,6 +1473,15 @@ def parse_args(argv: list[str]) -> dict:
             i += 1
         elif a == "--audit-bias":
             opts["audit_bias"] = True
+            i += 1
+        elif a == "--max-bytes":
+            if i + 1 >= len(argv) or not argv[i + 1].isdigit():
+                print("ERROR: --max-bytes needs a positive integer N", file=sys.stderr)
+                sys.exit(2)
+            opts["max_bytes"] = int(argv[i + 1])
+            i += 2
+        elif a == "--force-truncate":
+            opts["force_truncate"] = True
             i += 1
         else:
             rest.append(a)
@@ -1433,14 +1550,42 @@ def main() -> int:
             return 1
         jobs.append((entry, base_url, key))
 
-    prompt = build_prompt(query, files)
+    prompt = build_prompt(query, files, opts["max_bytes"], opts["force_truncate"])
     summary = query or "(no question — file review only)"
     if files:
         summary += f"  [files: {', '.join(files)}]"
 
-    # Heretic job: only fires if Kimi K3 is in this run's model list
-    heretic_job = next(
-        (j for j in jobs if j[0][0] == HERETIC_MODEL_ID), None
+    # Capability routing: if the full pack exceeds a model's context, that
+    # model gets structural outlines instead of full file bodies. The
+    # prompt layout is identical otherwise — file blocks then question — so
+    # the prefix cache still engages where blocks are shared.
+    prompt_len = len(prompt.encode("utf-8"))
+    prompt_map: dict[str, str] = {}
+    for entry, _base_url, _key in jobs:
+        mid = entry[0]
+        cap = MODEL_CONTEXT_CHARS.get(mid)
+        if cap is not None and prompt_len > cap and files:
+            outline_blocks = [
+                file_outline(p) for p in sorted(files, key=_stable_path_key)
+            ]
+            q = query or "Please review the file(s) above."
+            routed_prompt = "\n\n".join(
+                [b for b in outline_blocks if b] + [f"--- question ---\n{q}"]
+            )
+            print(
+                f"⚡ routing: {entry[1]} — full pack {prompt_len:,} bytes "
+                f"exceeds its context; sending structural outlines instead "
+                f"({len(routed_prompt.encode('utf-8')):,} bytes)",
+                file=sys.stderr,
+            )
+            prompt_map[mid] = routed_prompt
+        else:
+            prompt_map[mid] = prompt
+
+    # Heretic job: opt-in via --heretic, and only if Kimi K3 is in the run
+    heretic_job = (
+        next((j for j in jobs if j[0][0] == HERETIC_MODEL_ID), None)
+        if opts["heretic"] else None
     )
     n_calls = len(jobs) + (1 if heretic_job else 0)
     heretic_note = " + 🎭 heretic" if heretic_job else ""
@@ -1453,30 +1598,30 @@ def main() -> int:
     # Map future -> (model_id, role) so we can separate council from heretic
     # even when they share the same model_id (Kimi K3 plays both roles).
     future_roles: dict = {}
-    futures_list = []
     for e, base_url, key in jobs:
         f = pool.submit(
-            ask, e[0], prompt, base_url, key, MAIN_SYSTEM_PROMPT,
+            ask, e[0], prompt_map[e[0]], base_url, key, MAIN_SYSTEM_PROMPT,
             "council", stream_run_id,
         )
         future_roles[f] = (e[0], "council")
-        futures_list.append(f)
     heretic_future = None
     if heretic_job:
         entry, base_url, key = heretic_job
         heretic_future = pool.submit(
-            ask, entry[0], prompt, base_url, key, HERETIC_SYSTEM_PROMPT,
+            ask, entry[0], prompt_map[entry[0]], base_url, key, HERETIC_SYSTEM_PROMPT,
             "heretic", stream_run_id,
         )
         future_roles[heretic_future] = (entry[0], "heretic")
 
-    # Quorum-based return: collect completed results until deadline.
-    # Stragglers keep streaming to disk; their checkpoints are NOT lost.
+    # Quorum-based return: once QUORUM_COUNT council answers are in (or
+    # the deadline hits), return. Stragglers keep streaming to disk; their
+    # checkpoints are NOT lost.
     deadline = t0 + QUORUM_DEADLINE
     council_results: list = []
     heretic_result = None
     timed_out_models: list = []
     pending = set(future_roles.keys())
+    quorum = min(QUORUM_COUNT, len(jobs))
 
     while pending:
         remaining = deadline - time.monotonic()
@@ -1497,15 +1642,24 @@ def main() -> int:
                 heretic_result = result
             else:
                 council_results.append(result)
+        # Count-based quorum: enough good answers → stop waiting. Errors
+        # don't count toward quorum — a 429-then-retry shouldn't count as
+        # "answered". The opt-in heretic is never abandoned: if the user
+        # paid for it, we wait for its verdict (up to the deadline).
+        good = sum(
+            1 for _, c, _, _ in council_results if not c.startswith("ERROR:")
+        )
+        heretic_pending = (
+            heretic_future is not None and heretic_future in pending
+        )
+        if quorum > 0 and good >= quorum and not heretic_pending:
+            break
 
-    # Collect timed-out models
+    # Collect timed-out models (still pending when we stopped waiting)
     for fut in pending:
         mid, role = future_roles[fut]
         if role == "council":
             timed_out_models.append(mid)
-    heretic_timed_out = (
-        heretic_future is not None and heretic_future in pending
-    )
 
     # Try to cancel stragglers so they don't block process exit
     pool.shutdown(wait=False, cancel_futures=True)
@@ -1631,7 +1785,7 @@ def main() -> int:
         if len(ok_results) >= 2:
             run_claim_cartography(ok_results, run_id, crew_count)
 
-    # Blind Arena + Elo: ON by default (close the learning loop).
+    # Blind Arena + Elo: opt-in via --judge (extra calls cost money).
     # Uses the same response_ids enriched above for FK integrity.
     if opts["judge"] and run_id:
         # Build arena responses (council only — heretic excluded)
